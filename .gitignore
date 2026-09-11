@@ -1,0 +1,9 @@
+.DS_Store
+.vscode/
+__pycache__/
+*.keras
+*.task
+*.db
+extracted_features/
+media_dataset/
+mediapipe_env/
