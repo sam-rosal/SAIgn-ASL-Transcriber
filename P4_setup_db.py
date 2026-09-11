@@ -42,21 +42,31 @@ def init_system():
         extracted_features_path TEXT
     );""")
     
-    # Seed default UI lookups and sensitivities
-    gestures_seed = [
-        ('Victory', 'PEACE', 0.45),
-        ('Open_Palm', 'HELLO', 0.40),
-        ('Thumbs_Up', 'YES', 0.50),
-        ('Thumbs_Down', 'NO', 0.50)
-    ]
-    cursor.executemany("""
-        INSERT OR REPLACE INTO gesture_mappings (raw_label, display_name, min_score)
-        VALUES (?, ?, ?);
-    """, gestures_seed)
+    # 3. Auto-seed gesture database directly from media_dataset subdirectories
+    dataset_path = os.path.join(SCRIPT_DIR, 'media_dataset')
+
+    if os.path.exists(dataset_path):
+        valid_folders = [
+            d for d in os.listdir(dataset_path) 
+            if os.path.isdir(os.path.join(dataset_path, d)) and not d.startswith('.')
+        ]
+        
+        gestures_seed = [
+            (folder, folder.replace('_', ' ').title(), 0.45) 
+            for folder in valid_folders
+        ]
+        
+        cursor.executemany("""
+            INSERT OR IGNORE INTO gesture_mappings (raw_label, display_name, min_score)
+            VALUES (?, ?, ?);
+        """, gestures_seed)
     
+    # 4. Seed all active non-manual facial expression markers
     expressions_seed = [
-        ('mouthSmileLeft', 'Smile', 0.35),
-        ('browInnerUp', 'Surprise', 0.40)
+        ('mouthSmileLeft', 'Happy', 0.12),
+        ('browInnerUp', 'Surprised / Question', 0.035),
+        ('browLowerer', 'Angry', 0.025),
+        ('browSquint', 'Confused', 0.020)
     ]
     cursor.executemany("""
         INSERT OR REPLACE INTO expression_thresholds (blendshape_name, display_name, activation_threshold)
