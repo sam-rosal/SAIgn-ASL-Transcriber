@@ -1,427 +1,378 @@
 import os
-os.environ['PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION'] = 'python'
-
-# --- PROTOBUF 4/5 COMPATIBILITY PATCHES FOR MEDIAPIPE HOLISTIC (NECESSARY & IMPORTANT) ---
-from google.protobuf import descriptor as _descriptor
-from google.protobuf import symbol_database as _symbol_database
-from google.protobuf import message_factory as _message_factory
-
-# 1. Patch missing .label descriptor attribute
-if not hasattr(_descriptor.FieldDescriptor, 'label'):
-    _descriptor.FieldDescriptor.label = property(lambda self: getattr(self, '_label', None))
-
-# 2. Patch legacy GetPrototype method to use modern GetMessageClass for compatibility
-if not hasattr(_symbol_database.SymbolDatabase, 'GetPrototype'):
-    _symbol_database.SymbolDatabase.GetPrototype = lambda self, descriptor: _message_factory.GetMessageClass(descriptor)
-
-if not hasattr(_message_factory.MessageFactory, 'GetPrototype'):
-    _message_factory.MessageFactory.GetPrototype = lambda self, descriptor: _message_factory.GetMessageClass(descriptor)
-# -----------------------------------------------------------------
-
 import sqlite3
 import cv2
 import numpy as np
-import time
-import mediapipe as mp
-from mediapipe.python.solutions import holistic as mp_holistic
 import tensorflow as tf
-from tensorflow import keras
-from keras.models import Sequential
-from keras.layers import LSTM, Dense, Dropout, Masking
-from keras.callbacks import EarlyStopping, ModelCheckpoint
-from keras.utils import to_categorical
+from keras.models import load_model
+import mediapipe as mp
+from collections import deque, Counter
 
 # ==============================================================================
-# 1. SETUP MODEL ASSETS & DIRECTORY PATHS
+# PATHS & SYSTEM CONFIGURATION
 # ==============================================================================
+# Dynamically locate the script's directory to ensure relative paths resolve cleanly
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Database path fallbacks
+# File paths for SQLite database and trained Keras LSTM neural network model
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
-if not os.path.exists(DB_PATH):
-    DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
-
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
 
-MAX_SEQUENCE_LENGTH = 30  # Frame buffer length matching LSTM input shape
-CONFIDENCE_THRESHOLD = 0.5
-
-# --- REAL-TIME SIGN SEGMENTATION & DEBOUNCE CONFIGURATION ---
-VELOCITY_THRESHOLD = 0.015   # Minimum movement delta to qualify as active signing
-NEUTRAL_Y_THRESHOLD = 0.50    # Y-coordinate boundary (0 top, 1 bottom) representing resting area
-DEBOUNCE_COOLDOWN = 0.5       # Minimum time gap (seconds) required before allowing repeated words
-MIN_SIGN_FRAMES = 10          # Minimum collected frames required before triggering inference
+# Sequence buffer size expected by the LSTM network (30 consecutive video frames)
+SEQUENCE_LENGTH = 30 
 
 # ==============================================================================
-# 2. MANUAL SKELETON MAP (21 HAND LANDMARKS)
+# PREDICTION DEBOUNCING CONFIGURATION
 # ==============================================================================
-HAND_CONNECTIONS = [
-    (0, 1), (1, 2), (2, 3), (3, 4),
-    (0, 5), (5, 6), (6, 7), (7, 8),
-    (5, 9), (9, 10), (10, 11), (11, 12),
-    (9, 13), (13, 14), (14, 15), (15, 16),
-    (13, 17), (17, 18), (18, 19), (19, 20), (0, 17)
-]
+# Number of consecutive frame predictions tracked in the sliding history buffer
+DEBOUNCE_WINDOW_SIZE = 8
+
+# Minimum matching votes required within the history window to accept a gesture state update.
+# e.g., 5 out of 8 predictions must agree before updating the display HUD.
+DEBOUNCE_CONSENSUS_COUNT = 5
+
 
 # ==============================================================================
-# 3. DATABASE CONFIGURATION & RAM CACHING
+# HELPER FUNCTIONS: DATABASE & DATA PROCESSING
 # ==============================================================================
-def load_db_configurations():
-    """Connects to SQLite once and caches active mappings into RAM dictionaries."""
+def load_db_cache():
+    """
+    Connects to SQLite and reads configuration records into memory.
+    
+    Caching these settings avoids executing SQL queries inside the real-time 
+    video processing loop (30+ FPS), eliminating performance bottlenecks.
+
+    Returns:
+        tuple: (gesture_cache dict, expression_thresholds dict)
+    """
     gesture_cache = {}
-    expression_cache = {}
-    
-    if not os.path.exists(DB_PATH):
-        print(f"Warning: Database at {DB_PATH} not found. Running with default fallbacks.")
-        # Default expression fallback entries if DB missing
-        expression_cache = {
-            'browInnerUp': {'display_name': 'Surprised / Question', 'threshold': 0.035},
-            'mouthSmileLeft': {'display_name': 'Happy', 'threshold': 0.12},
-            'browLowerer': {'display_name': 'Angry', 'threshold': 0.025},
-            'browSquint': {'display_name': 'Confused', 'threshold': 0.020}
-        }
-        return gesture_cache, expression_cache
+    expression_thresholds = {}
 
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    
-    cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings")
-    for raw, display, min_score in cursor.fetchall():
-        gesture_cache[raw] = {'display_name': display, 'min_score': min_score}
-        
-    cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds")
-    for blendshape, display, threshold in cursor.fetchall():
-        expression_cache[blendshape] = {'display_name': display, 'threshold': threshold}
-        
-    conn.close()
-    
-    # Ensure fallbacks exist for new emotion blendshapes if DB lacks them
-    if 'browLowerer' not in expression_cache:
-        expression_cache['browLowerer'] = {'display_name': 'Angry', 'threshold': 0.025}
-    if 'browSquint' not in expression_cache:
-        expression_cache['browSquint'] = {'display_name': 'Confused', 'threshold': 0.020}
+    # Check if the database file exists before attempting connection
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
 
-    return gesture_cache, expression_cache
+        # 1. Fetch gesture mapping definitions and minimum confidence thresholds
+        cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings;")
+        for raw_label, display_name, min_score in cursor.fetchall():
+            gesture_cache[raw_label] = {
+                'display_name': display_name,
+                'min_score': min_score
+            }
 
-# ==============================================================================
-# 4. FEATURE EXTRACTION, GEOMETRY & MOTION HELPERS
-# ==============================================================================
-def extract_frame_landmarks(results):
-    """Flattens pose and dual hand landmarks into a unified 225-element vector."""
-    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten() if results.pose_landmarks else np.zeros(33 * 3)
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() if results.left_hand_landmarks else np.zeros(21 * 3)
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() if results.right_hand_landmarks else np.zeros(21 * 3)
-    return np.concatenate([pose, lh, rh])
+        # 2. Fetch facial blendshape/expression activation thresholds
+        cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds;")
+        for blendshape, display_name, threshold in cursor.fetchall():
+            expression_thresholds[blendshape] = {
+                'display_name': display_name,
+                'threshold': threshold
+            }
 
-def extract_hand_coordinates_only(results):
-    """Extracts raw 3D hand landmarks for velocity and neutral space detection."""
-    hands_combined = []
-    if results.left_hand_landmarks:
-        hands_combined.extend([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark])
-    if results.right_hand_landmarks:
-        hands_combined.extend([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark])
-    
-    return np.array(hands_combined) if len(hands_combined) > 0 else None
+        conn.close()
 
-def calculate_hand_velocity(prev_coords, curr_coords):
-    """Computes frame-to-frame mean landmark movement displacement (Velocity Thresholding)."""
-    if prev_coords is None or curr_coords is None or prev_coords.shape != curr_coords.shape:
-        return 0.0
-    return float(np.mean(np.linalg.norm(curr_coords - prev_coords, axis=1)))
+    return gesture_cache, expression_thresholds
 
-def is_hand_in_neutral_space(results):
-    """Checks if hands drop into lower torso/resting space (Neutral Space Detection)."""
-    if results.left_hand_landmarks and results.left_hand_landmarks.landmark[0].y > NEUTRAL_Y_THRESHOLD:
-        return True
-    if results.right_hand_landmarks and results.right_hand_landmarks.landmark[0].y > NEUTRAL_Y_THRESHOLD:
-        return True
-    return False
 
-def detect_expressions(results, expression_cache):
-    """Computes facial geometry thresholds for non-manual markers (Happy, Surprised, Angry, Confused)."""
-    active_expressions = {}
-    if not results.face_landmarks:
-        return active_expressions
-
-    face = results.face_landmarks.landmark
-
-    left_eyebrow = face[70].y
-    right_eyebrow = face[300].y
-    left_eye = face[159].y
-    right_eye = face[386].y
-    left_eye_bottom = face[145].y
-    
-    forehead_height = abs(left_eye - left_eyebrow)
-    eye_aperture = abs(left_eye_bottom - left_eye)
-
-    # 1. Eyebrow raise detection (Surprised / Question)
-    if 'browInnerUp' in expression_cache:
-        rule = expression_cache['browInnerUp']
-        if forehead_height > rule['threshold']:
-            strength = min(1.0, (forehead_height - rule['threshold']) / 0.05 + 0.5)
-            active_expressions[rule['display_name']] = strength
-
-    # 2. Smile detection (Happy)
-    mouth_left = face[61].x
-    mouth_right = face[291].x
-    mouth_top = face[13].y
-    mouth_bottom = face[14].y
-    mouth_width = abs(mouth_right - mouth_left)
-    mouth_height = abs(mouth_bottom - mouth_top)
-
-    if 'mouthSmileLeft' in expression_cache:
-        rule = expression_cache['mouthSmileLeft']
-        if mouth_width > rule['threshold']:
-            strength = min(1.0, (mouth_width - rule['threshold']) / 0.1 + 0.5)
-            active_expressions[rule['display_name']] = strength
-
-    # 3. Brow Lowerer / Furrow detection (Angry)
-    eyebrow_drop = (left_eye - left_eyebrow) + (right_eye - right_eyebrow)
-    if 'browLowerer' in expression_cache:
-        rule = expression_cache['browLowerer']
-        if forehead_height < rule['threshold'] and mouth_height < 0.03:
-            strength = min(1.0, (rule['threshold'] - forehead_height) / 0.02 + 0.5)
-            active_expressions[rule['display_name']] = strength
-
-    # 4. Asymmetric Brow / Squint detection (Confused)
-    brow_asymmetry = abs(left_eyebrow - right_eyebrow)
-    if 'browSquint' in expression_cache:
-        rule = expression_cache['browSquint']
-        if (brow_asymmetry > rule['threshold'] or eye_aperture < 0.012) and 'Angry' not in active_expressions:
-            strength = min(1.0, (brow_asymmetry / 0.03) + 0.4)
-            active_expressions[rule['display_name']] = strength
-
-    return active_expressions
-
-# ==============================================================================
-# 5. UI, COLOR GRADIENT & SKELETON RENDERING FUNCTIONS
-# ==============================================================================
 def get_confidence_color(score):
-    """Maps confidence score (0.0 - 1.0) to a BGR gradient from Light Blue to Red."""
-    factor = max(0.0, min(1.0, float(score)))
-    # Light Blue (BGR): (255, 200, 100) -> Pure Red (BGR): (0, 0, 255)
-    b = int(255 * (1.0 - factor) + 0 * factor)
-    g = int(200 * (1.0 - factor) + 0 * factor)
-    r = int(100 * (1.0 - factor) + 255 * factor)
+    """
+    Computes a dynamic BGR color gradient transitioning from Blue to Red 
+    based on the model's prediction confidence score.
+
+    Mathematical mapping:
+      - Score = 0.0 -> BGR(255, 0, 0)   [Pure Blue  - Low Confidence]
+      - Score = 1.0 -> BGR(0, 0, 255)   [Pure Red   - High Confidence]
+
+    Args:
+        score (float): Prediction probability between 0.0 and 1.0
+
+    Returns:
+        tuple: BGR color tuple for OpenCV rendering
+    """
+    # Clamp the confidence score strictly between 0.0 and 1.0 to prevent color overflows
+    score = max(0.0, min(1.0, float(score)))
+    
+    # Linear interpolation between channel intensities
+    b = int((1.0 - score) * 255)  # Decreases as confidence rises
+    r = int(score * 255)          # Increases as confidence rises
+    g = 0                         # Green channel remains zero
+    
     return (b, g, r)
 
-def draw_start_menu(frame):
-    """Renders dark background overlay start menu before starting the execution thread."""
-    overlay = frame.copy()
-    h, w, _ = frame.shape
+
+def extract_landmarks(results):
+    """
+    Flattens spatial (X, Y, Z) coordinates from MediaPipe Holistic output 
+    into a single 1D feature vector for input into the LSTM model.
+
+    Landmark breakdown:
+      - Pose: 33 landmarks * 3 spatial dimensions = 99 values
+      - Left Hand: 21 landmarks * 3 spatial dimensions = 63 values
+      - Right Hand: 21 landmarks * 3 spatial dimensions = 63 values
+      - Total Feature Dimension = 225 values per frame
+
+    Args:
+        results: MediaPipe Holistic framework output object
+
+    Returns:
+        np.ndarray: Flattened 1D numpy array containing landmark spatial features
+    """
+    # Extract pose landmarks (fall back to zeros array if body not detected)
+    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten() \
+        if results.pose_landmarks else np.zeros(33 * 3)
     
-    cv2.rectangle(overlay, (w//8, h//6), (7*w//8, 5*h//6), (15, 15, 15), -1)
-    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
-
-    cv2.rectangle(frame, (w//8, h//6), (7*w//8, h//6 + 10), (0, 255, 0), -1)
-
-    cv2.putText(frame, "SAIgn | AI ASL TRANSCRIBER", (w//2 - 190, h//3 - 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    # Extract left hand landmarks (fall back to zeros array if hand not detected)
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() \
+        if results.left_hand_landmarks else np.zeros(21 * 3)
     
-    cv2.putText(frame, "Real-Time Sequence Recognition Engine", (w//2 - 165, h//3 + 15), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-
-    cv2.putText(frame, "CONTROLS:", (w//8 + 40, h//2), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv2.LINE_AA)
-    cv2.putText(frame, "• PRESS 'SPACEBAR' TO START LIVE TRANSLATION", (w//8 + 50, h//2 + 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(frame, "• SENTENCE AUTO-CLEARS WHEN DISPLAY IS FULL", (w//8 + 50, h//2 + 55), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(frame, "• PRESS 'Q' OR 'ESC' TO TERMINATE", (w//8 + 50, h//2 + 80), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (180, 180, 180), 1, cv2.LINE_AA)
-
-    cv2.putText(frame, "READY - PRESS SPACE TO BEGIN", (w//2 - 145, 5*h//6 - 30), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
-
-def draw_manual_landmarks(image, hand_landmarks, color=(0, 255, 0)):
-    """Renders custom 21-point hand topology connections directly on the frame."""
-    if not hand_landmarks:
-        return
+    # Extract right hand landmarks (fall back to zeros array if hand not detected)
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() \
+        if results.right_hand_landmarks else np.zeros(21 * 3)
     
-    h, w, _ = image.shape
-    landmarks = hand_landmarks.landmark
+    # Concatenate all keypoint arrays into a single continuous feature vector
+    return np.concatenate([pose, lh, rh])
 
-    for connection in HAND_CONNECTIONS:
-        pt1 = (int(landmarks[connection[0]].x * w), int(landmarks[connection[0]].y * h))
-        pt2 = (int(landmarks[connection[1]].x * w), int(landmarks[connection[1]].y * h))
-        cv2.line(image, pt1, pt2, (200, 200, 200), 1)
 
-    for lm in landmarks:
-        cx, cy = int(lm.x * w), int(lm.y * h)
-        cv2.circle(image, (cx, cy), 3, color, -1)
+def detect_expressions(results, thresholds):
+    """
+    Calculates Euclidean distances between strategic facial landmark index pairs 
+    to infer active expressions based on SQLite threshold rules.
 
-def draw_ui_panel(frame, expressions, sentence=[]):
-    """Renders dark banner HUD overlay with colored sentence text and current emotion line (No progress bars)."""
-    overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (frame.shape[1], 75), (20, 20, 20), -1)
-    cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
+    Args:
+        results: MediaPipe Holistic framework output object
+        thresholds (dict): Expression thresholds loaded from SQLite
 
-    # Title header
-    cv2.putText(frame, "SAIgn | CUSTOM LSTM VISION ENGINE", (15, 20), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+    Returns:
+        list: Active expression display labels (e.g., ['Eyebrows Raised'])
+    """
+    active_emotions = []
+    
+    # Return empty if face keypoints are missing or database thresholds aren't loaded
+    if not results.face_landmarks or not thresholds:
+        return active_emotions
 
-    # 1. Output dynamic colored sentence (Gradient Light Blue -> Red based on score)
-    x_curr = 15
-    y_sentence = 40
-    prefix = "Sentence: "
-    cv2.putText(frame, prefix, (x_curr, y_sentence), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    x_curr += cv2.getTextSize(prefix, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+    landmarks = results.face_landmarks.landmark
 
-    if not sentence:
-        cv2.putText(frame, "Waiting for gestures...", (x_curr, y_sentence), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
-    else:
-        for word, score in sentence:
-            color = get_confidence_color(score)
-            word_str = f"{word} "
-            cv2.putText(frame, word_str, (x_curr, y_sentence), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
-            x_curr += cv2.getTextSize(word_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+    # 1. Eyebrow Squint / Lowering: Distance between inner eyebrow and upper nose bridge
+    if 'browLowerer' in thresholds or 'browSquint' in thresholds:
+        brow_dist = abs(landmarks[70].y - landmarks[159].y)
+        if 'browLowerer' in thresholds and brow_dist < thresholds['browLowerer']['threshold']:
+            active_emotions.append(thresholds['browLowerer']['display_name'])
+        elif 'browSquint' in thresholds and brow_dist < thresholds['browSquint']['threshold']:
+            active_emotions.append(thresholds['browSquint']['display_name'])
 
-    # 2. Output current emotion line in brackets with confidence gradient color
-    y_emotion = 60
-    emo_prefix = "Emotion: "
-    cv2.putText(frame, emo_prefix, (15, y_emotion), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
-    x_emo = 15 + cv2.getTextSize(emo_prefix, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0][0]
+    # 2. Eyebrow Raising: Distance between inner brow landmark and mid-nose landmark
+    if 'browInnerUp' in thresholds:
+        inner_brow = abs(landmarks[55].y - landmarks[6].y)
+        if inner_brow > thresholds['browInnerUp']['threshold']:
+            active_emotions.append(thresholds['browInnerUp']['display_name'])
 
-    if expressions:
-        top_emo = max(expressions.items(), key=lambda item: item[1])
-        emo_name, emo_score = top_emo[0], top_emo[1]
-        emo_text = f"({emo_name})"
-        emo_color = get_confidence_color(emo_score)
-    else:
-        emo_text = "(Neutral)"
-        emo_color = get_confidence_color(0.0)
+    # 3. Smiling: Distance between left corner and right corner of lips
+    if 'mouthSmileLeft' in thresholds:
+        smile_dist = abs(landmarks[61].x - landmarks[291].x)
+        if smile_dist > thresholds['mouthSmileLeft']['threshold']:
+            active_emotions.append(thresholds['mouthSmileLeft']['display_name'])
 
-    cv2.putText(frame, emo_text, (x_emo, y_emotion), 
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, emo_color, 1, cv2.LINE_AA)
+    return active_emotions
+
 
 # ==============================================================================
-# 6. MAIN PIPELINE EXECUTION THREAD
+# GUI SCREENS & STATE MANAGERS
 # ==============================================================================
-def run_system():
-    # Load database rule cache into RAM
-    gesture_cache, expression_cache = load_db_configurations()
-    print(f"Loaded {len(gesture_cache)} Gestures and {len(expression_cache)} Expressions from DB Cache.")
+def show_main_menu():
+    """
+    Creates and displays the graphical main menu canvas using OpenCV drawing utilities.
+    Handles keyboard input to route user to either the vision loop or shutdown.
 
-    # Load custom Keras LSTM model
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Missing model file at {MODEL_PATH}. Please run P4_train_model.py first.")
+    Returns:
+        str: User choice signal ('START' or 'QUIT')
+    """
+    # Create a blank black canvas image (600px height x 800px width x 3 color channels)
+    menu_bg = np.zeros((600, 800, 3), dtype=np.uint8)
+    
+    # Draw Outer Menu Border & Containers
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (35, 35, 35), -1)
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (0, 215, 255), 2)  # Gold border
 
-    print(f"Loading custom Keras model: {MODEL_PATH}")
-    model = tf.keras.models.load_model(MODEL_PATH)
+    # Draw Title and Subtitle Text
+    cv2.putText(menu_bg, "SAIgn Vision Engine", (160, 150), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(menu_bg, "Automated ASL & Expression HUD", (230, 200), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 1, cv2.LINE_AA)
 
-    classes = sorted(list(gesture_cache.keys())) if gesture_cache else []
+    # Option 1 Button Graphics: Start Engine
+    cv2.rectangle(menu_bg, (150, 280), (650, 350), (50, 50, 50), -1)
+    cv2.putText(menu_bg, "[ SPACE / ENTER ] Start Recognition", (170, 325), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 127), 2, cv2.LINE_AA)
 
-    sequence = []
-    sentence = []  # Stores tuples of (predicted_label, confidence_score)
-    prev_hand_coords = None
-    last_prediction = None
-    last_pred_time = 0
+    # Option 2 Button Graphics: Exit Program
+    cv2.rectangle(menu_bg, (150, 380), (650, 450), (50, 50, 50), -1)
+    cv2.putText(menu_bg, "[ ESC ] Shut Down Engine", (240, 425), 
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 127, 255), 2, cv2.LINE_AA)
 
+    cv2.imshow('SAIgn - Main Menu', menu_bg)
+
+    # Wait for menu interaction keypresses
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key == 27:  # ESC Key ASCII code -> Shut down application completely
+            cv2.destroyAllWindows()
+            return 'QUIT'
+        elif key in (13, 32):  # ENTER (13) or SPACE (32) ASCII code -> Launch Recognition Loop
+            cv2.destroyWindow('SAIgn - Main Menu')
+            return 'START'
+
+
+def run_recognition_engine(model, gesture_cache, expression_thresholds):
+    """
+    Initializes hardware webcam stream and MediaPipe pipeline.
+    Maintains a temporal sliding window buffer for real-time LSTM gesture classification
+    and integrates prediction debouncing to prevent live display flicker.
+
+    Args:
+        model: Loaded Keras neural network model instance
+        gesture_cache (dict): Dynamic gesture key and label database dictionary
+        expression_thresholds (dict): Dynamic expression boundary dictionary
+    """
+    # Reconstruct gesture label index lookup array based on database keys
+    labels = list(gesture_cache.keys()) if gesture_cache else ['UNKNOWN']
+    
+    # Initialize MediaPipe Holistic solutions and webcam capture interface
+    mp_holistic = mp.solutions.holistic
+    mp_drawing = mp.solutions.drawing_utils
     cap = cv2.VideoCapture(0)
 
-    in_start_menu = True
-    print("\nStarting camera feed. Displaying Start Menu overlay.")
+    sequence_buffer = []  # Rolling temporal sequence buffer holding 30 landmark feature vectors
+    
+    # Prediction Debouncing History Queue:
+    # Maintains the last N raw candidate predictions to form a majority vote consensus
+    prediction_history = deque(maxlen=DEBOUNCE_WINDOW_SIZE)
+    
+    current_gesture = "Waiting..."
+    confidence = 0.0
 
-    while in_start_menu and cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-
-        frame = cv2.flip(frame, 1)
-        draw_start_menu(frame)
-        cv2.imshow('SAIgn Database-Driven Vision Frame', frame)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord(' '):
-            in_start_menu = False
-        elif key == 27 or key == ord('q'):
-            cap.release()
-            cv2.destroyAllWindows()
-            return
-
-    print("Exited Start Menu. Live ASL Translation active. Press 'q' or 'ESC' to terminate.")
-
-    with mp_holistic.Holistic(
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5
-    ) as holistic:
-
+    # Instantiate holistic tracking model with confidence thresholds
+    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
 
-            frame = cv2.flip(frame, 1)
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic.process(rgb_frame)
+            # Convert BGR frame from OpenCV to RGB for MediaPipe inference
+            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image.flags.writeable = False  # Improve processing performance
+            results = holistic.process(image)
 
-            landmarks = extract_frame_landmarks(results)
-            curr_hand_coords = extract_hand_coordinates_only(results)
+            # Re-enable writing and convert back to BGR for rendering in OpenCV window
+            image.flags.writeable = True
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-            velocity = calculate_hand_velocity(prev_hand_coords, curr_hand_coords)
-            is_moving = velocity > VELOCITY_THRESHOLD
-            in_neutral = is_hand_in_neutral_space(results)
-            prev_hand_coords = curr_hand_coords
+            # Overlay spatial landmark points on screen
+            mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+            mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
 
-            if is_moving and not in_neutral:
-                sequence.append(landmarks)
-            else:
-                if len(sequence) >= MIN_SIGN_FRAMES and classes:
-                    padded_sequence = sequence[-MAX_SEQUENCE_LENGTH:]
-                    if len(padded_sequence) < MAX_SEQUENCE_LENGTH:
-                        padding = [np.zeros_like(landmarks)] * (MAX_SEQUENCE_LENGTH - len(padded_sequence))
-                        padded_sequence = padding + padded_sequence
+            # Extract 1D feature vector and push onto sliding window queue
+            keypoints = extract_landmarks(results)
+            sequence_buffer.append(keypoints)
+            sequence_buffer = sequence_buffer[-SEQUENCE_LENGTH:]  # Maintain max queue size = 30
 
-                    input_data = np.expand_dims(padded_sequence, axis=0)
-                    predictions = model.predict(input_data, verbose=0)[0]
-                    best_idx = np.argmax(predictions)
-                    raw_name = classes[best_idx]
-                    score = float(predictions[best_idx])
+            # Execute LSTM classification when window buffer contains 30 frames
+            if len(sequence_buffer) == SEQUENCE_LENGTH:
+                # Add batch dimension: shape (1, 30, 225)
+                res = model.predict(np.expand_dims(sequence_buffer, axis=0), verbose=0)[0]
+                prediction_idx = np.argmax(res)
+                confidence = float(res[prediction_idx])
 
-                    config = gesture_cache.get(raw_name, {'display_name': raw_name, 'min_score': CONFIDENCE_THRESHOLD})
-                    if score >= config['min_score']:
-                        predicted_label = config['display_name']
+                raw_label = labels[prediction_idx] if prediction_idx < len(labels) else "UNKNOWN"
+                
+                # Fetch threshold & display mapping from memory cache (with safety fallback)
+                cached_data = gesture_cache.get(raw_label, {
+                    'display_name': raw_label.replace('_', ' ').title(),
+                    'min_score': 0.40
+                })
 
-                        current_time = time.time()
-                        is_duplicate = (predicted_label == last_prediction)
-                        time_elapsed = current_time - last_pred_time
+                # Validate model probability against database threshold to determine frame candidate
+                if confidence >= cached_data['min_score']:
+                    frame_candidate = cached_data['display_name']
+                else:
+                    frame_candidate = "Uncertain"
 
-                        if not is_duplicate or time_elapsed > DEBOUNCE_COOLDOWN:
-                            test_sentence = sentence + [(predicted_label, score)]
-                            test_str = "Sentence: " + " ".join([item[0] for item in test_sentence])
-                            text_width, _ = cv2.getTextSize(test_str, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+                # Append immediate single-frame prediction to debouncing history queue
+                prediction_history.append(frame_candidate)
 
-                            max_display_width = frame.shape[1] - 30
-                            if text_width > max_display_width:
-                                sentence.clear()
+                # ==============================================================================
+                # PREDICTION DEBOUNCING MECHANISM
+                # ==============================================================================
+                # Count the frequency of each predicted gesture label across the history window
+                vote_counts = Counter(prediction_history)
+                most_common_gesture, vote_count = vote_counts.most_common(1)[0]
 
-                            sentence.append((predicted_label, score))
-                            last_prediction = predicted_label
-                            last_pred_time = current_time
+                # Update output HUD state ONLY if candidate receives majority consensus
+                if vote_count >= DEBOUNCE_CONSENSUS_COUNT:
+                    current_gesture = most_common_gesture
 
-                    sequence.clear()
+            # Perform facial expression analysis
+            active_expressions = detect_expressions(results, expression_thresholds)
+            emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
 
-            active_expressions = detect_expressions(results, expression_cache)
+            # Compute dynamic HUD border color based on model prediction certainty
+            hud_color = get_confidence_color(confidence)
 
-            if results.left_hand_landmarks:
-                draw_manual_landmarks(frame, results.left_hand_landmarks, color=(0, 255, 0))
-            if results.right_hand_landmarks:
-                draw_manual_landmarks(frame, results.right_hand_landmarks, color=(0, 255, 255))
+            # Draw HUD Overlays (Background Box & Dynamic Colored Border)
+            cv2.rectangle(image, (10, 10), (480, 110), (30, 30, 30), -1)
+            cv2.rectangle(image, (10, 10), (480, 110), hud_color, 2)
 
-            draw_ui_panel(frame, active_expressions, sentence)
+            # Render Recognized Gesture and Emotion Text Lines
+            cv2.putText(image, f"Sign: {current_gesture} ({confidence*100:.1f}%)", 
+                        (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, hud_color, 2, cv2.LINE_AA)
+            cv2.putText(image, emotion_text, 
+                        (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
 
-            cv2.imshow('SAIgn Database-Driven Vision Frame', frame)
+            # Display composite visual output window
+            cv2.imshow('SAIgn - Live Recognition Engine', image)
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27 or key == ord('q'):
+            # Listen for Escape key press (ASCII 27) -> Stop capture and exit loop
+            if cv2.waitKey(10) & 0xFF == 27:
                 break
 
+    # Clean up video capture hardware and close vision window
     cap.release()
-    cv2.destroyAllWindows()
+    cv2.destroyWindow('SAIgn - Live Recognition Engine')
+
+
+# ==============================================================================
+# MAIN PROGRAM EXECUTION ENTRY POINT
+# ==============================================================================
+def main():
+    """
+    Main entry point for the application.
+    Loads models, handles state machine transitions between Menu and Vision loop.
+    """
+    # 1. Ensure required neural network binary file exists on disk
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file not found at {MODEL_PATH}. "
+            "Please run P4_train_model.py to generate the trained model."
+        )
+
+    # Load compiled Keras LSTM model into memory
+    model = load_model(MODEL_PATH)
+
+    # 2. Main Program GUI State Machine Loop
+    while True:
+        # Reload SQLite cache on each main menu loop to catch database updates on-the-fly
+        gesture_cache, expression_thresholds = load_db_cache()
+
+        # Render menu and block until user inputs action choice
+        action = show_main_menu()
+
+        if action == 'QUIT':
+            print("Exiting SAIgn Engine cleanly. Goodbye!")
+            break
+        elif action == 'START':
+            # Launch webcam vision engine loop (runs until ESC is pressed)
+            run_recognition_engine(model, gesture_cache, expression_thresholds)
+
 
 if __name__ == "__main__":
-    run_system()
+    main()
