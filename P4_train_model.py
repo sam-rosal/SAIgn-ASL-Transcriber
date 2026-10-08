@@ -1,36 +1,132 @@
-import sqlite3
+import cv2
+import mediapipe as mp
 import numpy as np
+import os
+import sqlite3
 from scipy.interpolate import interp1d
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
-from keras.utils import to_categorical
-from keras.models import Model
-from keras.layers import Input, Masking, LSTM, Dropout, Dense, Attention, GlobalAveragePooling1D
-from keras.callbacks import EarlyStopping, ModelCheckpoint
 
-# --- System Configuration & File Paths ---
-DB_PATH = "saign_vision.db"         # SQLite database containing frame feature metadata
-MODEL_SAVE_PATH = "asl_model.keras"  # Output path for the trained model artifact
-EPOCHS = 50                          # Maximum training iterations
-BATCH_SIZE = 16                      # Batch size for gradient descent updates
-TARGET_FRAMES = 30                   # Fixed temporal sequence length required for input tensor shape
+# --- System & Path Configurations ---
+# Resolve absolute directory path where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Filepaths for database connection, raw video inputs, and output feature binaries
+DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
+DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
+FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
+
+# --- Sequence Length Configuration ---
+# TARGET_FRAMES: Fixed frame length required for temporal model input standardization.
+TARGET_FRAMES = 30  
+
+# --- Velocity Segmentation Configuration Parameters ---
+# VELOCITY_THRESHOLD: Minimum Euclidean distance (L2 norm displacement) between consecutive landmark vectors required to qualify a frame as active motion.
+VELOCITY_THRESHOLD = 0.015  
+
+# MIN_ACTIVE_FRAMES: Fallback guardrail to ensure fast or brief signs aren't 
+# over-filtered below a usable sequence length.
+MIN_ACTIVE_FRAMES = 10     
+
+# --- Initialize MediaPipe Hands Pipeline ---
+mp_hands = mp.solutions.hands
+hands_extractor = mp_hands.Hands(
+    static_image_mode=False,        # Continuous video stream mode for temporal tracking optimizations
+    max_num_hands=2,               # Detect up to 2 hands simultaneously
+    min_detection_confidence=0.5   # Minimum detection confidence threshold
+)
+
+
+def extract_video_landmarks(video_path):
+    """
+    Reads a video frame-by-frame, runs MediaPipe hand tracking, and converts
+    detected joint spatial coordinates into a structured NumPy matrix.
+
+    Output matrix shape: (total_frames, 126)
+    - 2 hands * 21 landmarks * 3 coordinates (x, y, z) = 126 float values per frame.
+    """
+    cap = cv2.VideoCapture(video_path)
+    video_features = []
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: 
+            break
+        
+        # OpenCV reads BGR; MediaPipe requires RGB frame inputs
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = hands_extractor.process(rgb_frame)
+        
+        # Pre-allocate a zero array for up to 2 hands (2 * 21 * 3 = 126 elements)
+        # Unused hand slots remain padded with 0.0 if < 2 hands are detected
+        frame_coordinates = np.zeros(126) 
+        
+        # Populate coordinates if hands are detected
+        if results.multi_hand_landmarks:
+            for idx, hand_landmarks in enumerate(results.multi_hand_landmarks[:2]):
+                coords = []
+                for lm in hand_landmarks.landmark:
+                    coords.extend([lm.x, lm.y, lm.z])
+                
+                # Assign to slice: Hand 1 occupies [0:63], Hand 2 occupies [63:126]
+                start_idx = idx * 63
+                frame_coordinates[start_idx : start_idx + len(coords)] = coords
+                
+        video_features.append(frame_coordinates)
+        
+    cap.release()
+    return np.array(video_features)
+
+
+def apply_velocity_segmentation(features, threshold=VELOCITY_THRESHOLD, min_frames=MIN_ACTIVE_FRAMES):
+    """
+    Filters out static transition frames (e.g., hand at rest or moving into position)
+    by computing frame-to-frame Euclidean landmark displacement (velocity).
+
+    Mathematical Pipeline:
+    1. Calculate delta vector between adjacent time steps: ΔF = F[t] - F[t-1]
+    2. Compute L2 norm (magnitude) of ΔF across landmark dimensions.
+    3. Retain frames where spatial displacement meets or exceeds the velocity threshold.
+    """
+    # Cannot calculate velocity across fewer than 2 frames
+    if len(features) < 2:
+        return features
+
+    # Step 1: Compute coordinate differences between adjacent frames
+    frame_differences = features[1:] - features[:-1]
+    
+    # Step 2: Calculate Euclidean displacement magnitude (L2 norm) per frame step
+    velocities = np.linalg.norm(frame_differences, axis=1)
+
+    # Step 3: Construct boolean mask; keep initial frame, then check threshold
+    active_mask = np.ones(len(features), dtype=bool)
+    active_mask[1:] = velocities >= threshold
+
+    # Filter out static frames
+    filtered_features = features[active_mask]
+
+    # Fallback guardrail: If filtering dropped too many frames, revert to raw sequence
+    if len(filtered_features) < min_frames:
+        return features
+
+    return filtered_features
 
 
 def resample_sequence(features, target_frames=TARGET_FRAMES):
     """
-    Safeguard function: Resamples any keypoint array to (target_frames, 126)
-    using 1D linear temporal interpolation if it was extracted with non-standard frame lengths.
-    
+    Resamples a keypoint sequence matrix of shape (T, 126) to exactly (target_frames, 126)
+    using 1D linear temporal interpolation across the time axis.
+
     Mathematical Pipeline:
-    1. Map original sequence timeline to normalized range [0.0, 1.0].
-    2. Interpolate across the temporal axis to generate exactly target_frames timesteps.
+    1. Map original sequence indices [0, ..., T-1] to normalized timeline [0.0, 1.0].
+    2. Generate target timeline [0.0, 1.0] with exactly target_frames steps.
+    3. Linearly interpolate features across time axis (axis=0) to standardize shape.
     """
     current_frames = len(features)
+    
     if current_frames == target_frames:
         return features
 
-    # Fallback for sequences with fewer than 2 frames
     if current_frames < 2:
+        # Fallback padding if video yields fewer than 2 active frames
         pad_amount = max(0, target_frames - current_frames)
         return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
 
@@ -38,125 +134,112 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
     x_old = np.linspace(0, 1, num=current_frames)
     x_new = np.linspace(0, 1, num=target_frames)
     
-    # Perform 1D linear interpolation across temporal axis (axis=0)
+    # Perform 1D linear interpolation across temporal axis
     interpolator = interp1d(x_old, features, axis=0, kind='linear')
     return interpolator(x_new)
 
 
-def load_split_from_sqlite(split_name):
-    """Loads features and labels from SQLite filtered by dataset split, enforcing 30-frame sequence shape."""
+def register_and_process_dataset():
+    """
+    Scans dataset subdirectories, extracts landmarks, applies velocity segmentation, 
+    resamples feature sequences to exactly 30 frames, saves feature matrices to disk (.npy), 
+    and queries saign_vision.db to retrieve and associate official MS-ASL split tags ('train', 'val', 'test').
+    """
+    # Ensure features directory exists
+    os.makedirs(FEATURES_DIR, exist_ok=True)
+    
+    # Connect to SQLite database
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT npy_path, label FROM training_dataset WHERE split = ?", (split_name,))
-    rows = cursor.fetchall()
+    
+    # Iterate over sign label subdirectories (e.g., media_dataset/hello/)
+    for label_dir in os.listdir(DATASET_DIR):
+        label_path = os.path.join(DATASET_DIR, label_dir)
+        if not os.path.isdir(label_path): 
+            continue
+            
+        # Iterate over video files inside label directory
+        for video_file in os.listdir(label_path):
+            if not video_file.lower().endswith(('.mp4', '.avi', '.mov')): 
+                continue
+                
+            video_path = os.path.join(label_path, video_file)
+            
+            # Construct output filepath for NumPy feature binary
+            feature_filename = f"{os.path.splitext(video_file)[0]}_landmarks.npy"
+            output_feature_path = os.path.join(FEATURES_DIR, feature_filename)
+            
+            # Retrieve partition split tag directly from video_clips table in saign_vision.db
+            yt_id = video_file.split('_')[0] if '_' in video_file else video_file
+            cursor.execute("""
+                SELECT split FROM video_clips 
+                WHERE file_title = ? OR url LIKE ? 
+                LIMIT 1
+            """, (video_file, f"%{yt_id}%"))
+            result = cursor.fetchone()
+            split_tag = result[0] if result else 'train'
+
+            print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
+            
+            # Step 1: Extract 3D landmark coordinates frame-by-frame
+            raw_features = extract_video_landmarks(video_path)
+            if len(raw_features) == 0: 
+                continue
+                
+            # Step 2: Apply Velocity Segmentation to remove idle frames
+            segmented_features = apply_velocity_segmentation(raw_features)
+            
+            # Step 3: Apply Temporal Resampling to enforce fixed 30-frame sequence shape (30, 126)
+            fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
+            
+            # Step 4: Save processed feature array to disk
+            np.save(output_feature_path, fixed_features)
+            
+            # Step 5: Index feature path, active frame count, and partition tag into SQLite DB
+            cursor.execute("""
+                INSERT OR REPLACE INTO training_dataset 
+                (video_path, label, num_frames, extracted_features_path, npy_path, split)
+                VALUES (?, ?, ?, ?, ?, ?);
+            """, (
+                video_path, 
+                label_dir, 
+                len(fixed_features), 
+                output_feature_path, 
+                output_feature_path, 
+                split_tag
+            ))
+            
+    # Commit database transactions and close connection
+    conn.commit()
     conn.close()
-
-    X, y = [], []
-    for npy_path, label in rows:
-        try:
-            raw_data = np.load(npy_path)
-            # Enforce strict (30, 126) input tensor shape via temporal resampling guardrail
-            standardized_data = resample_sequence(raw_data, target_frames=TARGET_FRAMES)
-            X.append(standardized_data)
-            y.append(label)
-        except Exception as e:
-            print(f"Warning: Missing file or corrupt binary {npy_path}: {e}")
-
-    return np.array(X), np.array(y)
+    print("\nFeature extraction with Velocity Segmentation & 30-Frame Resampling complete! All entries logged in SQLite DB.")
 
 
-def build_lstm_attention_model(input_shape, num_classes):
+def load_split_data(split_name, db_path=DB_PATH):
     """
-    Constructs a Functional API Neural Network with stacked LSTM layers, 
-    a Temporal Self-Attention Mechanism, and Global Pooling.
+    Queries the training_dataset table in SQLite DB to load extracted feature file paths (.npy)
+    and associated sign labels for a specific data split ('train', 'val', or 'test').
     """
-    # Input Layer: shape expected as (sequence_length=30, feature_dimensions)
-    inputs = Input(shape=input_shape, name="landmark_input")
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
     
-    # Masking Layer: Ignores zero-padded frames added during preprocessing
-    masked = Masking(mask_value=0.0)(inputs)
-    
-    # First LSTM Layer: return_sequences=True retains temporal sequence outputs for attention
-    lstm1 = LSTM(64, return_sequences=True, activation='tanh')(masked)
-    lstm1 = Dropout(0.2)(lstm1)  # Regularization to prevent overfitting
-    
-    # Second LSTM Layer: Preserves full sequence dimensions (30, 64) required by the Attention layer
-    lstm2 = LSTM(64, return_sequences=True, activation='tanh')(lstm1)
-    lstm2 = Dropout(0.2)(lstm2)
-    
-    # Self-Attention Mechanism: Calculates query-key context scores across all 30 frames 
-    # to weight peak gesture frames higher than start/end transition frames
-    attn_out = Attention(name="attention_layer")([lstm2, lstm2])
-    
-    # Global Average Pooling: Flattens temporal sequence outputs (30, 64) -> (64,) vector
-    pooled = GlobalAveragePooling1D()(attn_out)
-    
-    # Dense Feature Mapping Layer
-    dense1 = Dense(32, activation='relu')(pooled)
-    
-    # Final Classification Output Layer: Probabilities across all ASL classes
-    outputs = Dense(num_classes, activation='softmax')(dense1)
-    
-    # Build Keras Functional Model
-    model = Model(inputs=inputs, outputs=outputs, name="SAIgn_LSTM_Attention")
-    
-    # Compile model using categorical cross-entropy loss for multi-class classification
-    model.compile(
-        optimizer='adam',
-        loss='categorical_crossentropy',
-        metrics=['accuracy']
-    )
-    return model
-
-
-def train():
-    print("Loading MS-ASL partitions from SQLite...")
-    X_train_raw, y_train_raw = load_split_from_sqlite("train")
-    X_val_raw, y_val_raw     = load_split_from_sqlite("val")
-    X_test_raw, y_test_raw   = load_split_from_sqlite("test")
-
-    # Fit LabelEncoder on training set targets
-    label_encoder = LabelEncoder()
-    y_train_enc = label_encoder.fit_transform(y_train_raw)
-    
-    # Transform validation and test targets using fitted encoder
-    y_val_enc  = label_encoder.transform(y_val_raw)
-    y_test_enc = label_encoder.transform(y_test_raw)
-
-    num_classes = len(label_encoder.classes_)
-    np.save("classes.npy", label_encoder.classes_)
-
-    # Convert to One-Hot Encoding
-    y_train = to_categorical(y_train_enc, num_classes=num_classes)
-    y_val   = to_categorical(y_val_enc,   num_classes=num_classes)
-    y_test  = to_categorical(y_test_enc,  num_classes=num_classes)
-
-    print(f"Data Split -> Train: {len(X_train_raw)} | Val: {len(X_val_raw)} | Test: {len(X_test_raw)}")
-
-    # Build model using training shape
-    input_shape = (X_train_raw.shape[1], X_train_raw.shape[2])
-    model = build_lstm_attention_model(input_shape, num_classes)
-
-########################### Early Stopping ####################################
-    callbacks = [
-        EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True),
-        ModelCheckpoint(MODEL_SAVE_PATH, monitor='val_accuracy', save_best_only=True, verbose=1)
-    ]
-
-    model.fit(
-        X_train_raw, y_train,
-        validation_data=(X_val_raw, y_val),
-        epochs=EPOCHS,
-        batch_size=BATCH_SIZE,
-        callbacks=callbacks
-    )
-
-    print("\nEvaluating model on official MS-ASL Test Set...")
-    test_loss, test_acc = model.evaluate(X_test_raw, y_test)
-    print(f"Official Test Accuracy: {test_acc * 100:.2f}%")
-
-    model.save(MODEL_SAVE_PATH)
+    # Query training_dataset table for feature paths matching the split
+    query = "SELECT npy_path, label FROM training_dataset WHERE split = ?"
+    data = cursor.execute(query, (split_name,)).fetchall()
+    conn.close()
+    return data
 
 
 if __name__ == "__main__":
-    train()
+    # Step 1: Execute feature extraction pipeline and log metadata to saign_vision.db
+    register_and_process_dataset()
+
+    # Step 2: Retrieve partitioned dataset samples for model training & evaluation
+    print("\n--- Loading Dataset Splits from DB ---")
+    train_data = load_split_data('train')
+    val_data   = load_split_data('val')
+    test_data  = load_split_data('test')
+
+    print(f"Training samples: {len(train_data)}")
+    print(f"Validation samples: {len(val_data)}")
+    print(f"Testing samples: {len(test_data)}")
