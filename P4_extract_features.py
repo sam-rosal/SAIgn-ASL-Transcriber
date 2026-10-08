@@ -3,6 +3,7 @@ import mediapipe as mp
 import numpy as np
 import os
 import sqlite3
+from scipy.interpolate import interp1d
 
 # --- System & Path Configurations ---
 # Resolve absolute directory path where this script is located
@@ -12,6 +13,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
 FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
+
+# --- Sequence Length Configuration ---
+# TARGET_FRAMES: Fixed frame length required for temporal model input standardization.
+TARGET_FRAMES = 30  
 
 # --- Velocity Segmentation Configuration Parameters ---
 # VELOCITY_THRESHOLD: Minimum Euclidean distance (L2 norm displacement) between consecutive landmark vectors required to qualify a frame as active motion.
@@ -105,11 +110,40 @@ def apply_velocity_segmentation(features, threshold=VELOCITY_THRESHOLD, min_fram
     return filtered_features
 
 
+def resample_sequence(features, target_frames=TARGET_FRAMES):
+    """
+    Resamples a keypoint sequence matrix of shape (T, 126) to exactly (target_frames, 126)
+    using 1D linear temporal interpolation across the time axis.
+
+    Mathematical Pipeline:
+    1. Map original sequence indices [0, ..., T-1] to normalized timeline [0.0, 1.0].
+    2. Generate target timeline [0.0, 1.0] with exactly target_frames steps.
+    3. Linearly interpolate features across time axis (axis=0) to standardize shape.
+    """
+    current_frames = len(features)
+    
+    if current_frames == target_frames:
+        return features
+
+    if current_frames < 2:
+        # Fallback padding if video yields fewer than 2 active frames
+        pad_amount = max(0, target_frames - current_frames)
+        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
+
+    # Map original and target time steps to normalized range [0.0, 1.0]
+    x_old = np.linspace(0, 1, num=current_frames)
+    x_new = np.linspace(0, 1, num=target_frames)
+    
+    # Perform 1D linear interpolation across temporal axis
+    interpolator = interp1d(x_old, features, axis=0, kind='linear')
+    return interpolator(x_new)
+
+
 def register_and_process_dataset():
     """
     Scans dataset subdirectories, extracts landmarks, applies velocity segmentation, 
-    saves feature matrices to disk (.npy), and registers metadata and MS-ASL split 
-    tags ('train', 'val', 'test') into the SQLite database.
+    resamples feature sequences to exactly 30 frames, saves feature matrices to disk (.npy), 
+    and registers metadata and MS-ASL split tags ('train', 'val', 'test') into the SQLite database.
     """
     # Ensure features directory exists
     os.makedirs(FEATURES_DIR, exist_ok=True)
@@ -152,10 +186,13 @@ def register_and_process_dataset():
             # Step 2: Apply Velocity Segmentation to remove idle frames
             segmented_features = apply_velocity_segmentation(raw_features)
             
-            # Step 3: Save processed feature array to disk
-            np.save(output_feature_path, segmented_features)
+            # Step 3: Apply Temporal Resampling to enforce fixed 30-frame sequence shape (30, 126)
+            fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
             
-            # Step 4: Index feature path, active frame count, and partition tag into SQLite DB
+            # Step 4: Save processed feature array to disk
+            np.save(output_feature_path, fixed_features)
+            
+            # Step 5: Index feature path, active frame count, and partition tag into SQLite DB
             cursor.execute("""
                 INSERT OR REPLACE INTO training_dataset 
                 (video_path, label, num_frames, extracted_features_path, npy_path, split)
@@ -163,7 +200,7 @@ def register_and_process_dataset():
             """, (
                 video_path, 
                 label_dir, 
-                len(segmented_features), 
+                len(fixed_features), 
                 output_feature_path, 
                 output_feature_path, 
                 split_tag
@@ -172,7 +209,7 @@ def register_and_process_dataset():
     # Commit database transactions and close connection
     conn.commit()
     conn.close()
-    print("\nFeature extraction with Velocity Segmentation complete! All entries logged in SQLite DB.")
+    print("\nFeature extraction with Velocity Segmentation & 30-Frame Resampling complete! All entries logged in SQLite DB.")
 
 
 if __name__ == "__main__":
