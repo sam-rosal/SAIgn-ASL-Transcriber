@@ -18,6 +18,9 @@ def init_system():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
+    # Enable foreign key enforcement in SQLite
+    cursor.execute("PRAGMA foreign_keys = ON;")
+    
     # Gesture Mapping Table
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS gesture_mappings (
@@ -36,17 +39,24 @@ def init_system():
         activation_threshold REAL NOT NULL
     );""")
     
-    # Training Dataset Table (Includes 'split' for Train/Val/Test partitioning)
+    # Training Dataset Table (Includes 'split' for Train/Val/Test partitioning and foreign key relation to video_clips)
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS training_dataset (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        clip_id INTEGER,
         video_path TEXT UNIQUE,
         label TEXT NOT NULL,
         num_frames INTEGER,
         extracted_features_path TEXT,
         npy_path TEXT,
-        split TEXT NOT NULL DEFAULT 'train'
+        split TEXT NOT NULL DEFAULT 'train',
+        FOREIGN KEY (clip_id) REFERENCES video_clips(id) ON DELETE SET NULL
     );""")
+    
+    # Database Index for Fast Partition Querying
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);
+    """)
     
     # 3. Auto-seed gesture database directly from media_dataset subdirectories
     dataset_path = os.path.join(SCRIPT_DIR, 'media_dataset')
@@ -68,11 +78,18 @@ def init_system():
         """, gestures_seed)
     
     # 4. Seed active non-manual facial expression markers
+# 4. Seed active non-manual facial expression markers
     expressions_seed = [
         ('mouthSmileLeft', 'Happy', 0.12),
-        ('browInnerUp', 'Surprised / Question', 0.035),
+        ('mouthSmileRight', 'Happy', 0.12),
+        ('browInnerUp', 'Question', 0.035),
         ('browLowerer', 'Angry', 0.025),
-        ('browSquint', 'Confused', 0.020)
+        ('browSquint', 'Confused', 0.020),
+        ('mouthFrownLeft', 'Sad / Concerned', 0.030),
+        ('mouthFrownRight', 'Sad / Concerned', 0.030),
+        ('noseSneerLeft', 'Disgust', 0.025),
+        ('noseSneerRight', 'Disgust', 0.025),
+        ('faceNeutral', 'Neutral', 0.000)
     ]
     cursor.executemany("""
         INSERT OR REPLACE INTO expression_thresholds (blendshape_name, display_name, activation_threshold)

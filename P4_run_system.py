@@ -167,10 +167,46 @@ def detect_expressions(results, thresholds):
             active_emotions.append(thresholds['browInnerUp']['display_name'])
 
     # 3. Smiling: Distance between left corner and right corner of lips
-    if 'mouthSmileLeft' in thresholds:
-        smile_dist = abs(landmarks[61].x - landmarks[291].x)
-        if smile_dist > thresholds['mouthSmileLeft']['threshold']:
-            active_emotions.append(thresholds['mouthSmileLeft']['display_name'])
+    if 'mouthSmileLeft' in thresholds or 'mouthSmileRight' in thresholds:
+        left_smile = abs(landmarks[61].x - landmarks[13].x)
+        right_smile = abs(landmarks[291].x - landmarks[13].x)
+        
+        left_active = 'mouthSmileLeft' in thresholds and left_smile > thresholds['mouthSmileLeft']['threshold']
+        right_active = 'mouthSmileRight' in thresholds and right_smile > thresholds['mouthSmileRight']['threshold']
+        
+        if left_active or right_active:
+            display_label = thresholds.get('mouthSmileLeft', thresholds.get('mouthSmileRight', {})).get('display_name', 'Happy')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # 4. Mouth Frowning: Distance between lip corners and mouth center for Sad / Concerned
+    if 'mouthFrownLeft' in thresholds or 'mouthFrownRight' in thresholds:
+        left_frown = landmarks[61].y - landmarks[17].y
+        right_frown = landmarks[291].y - landmarks[17].y
+        
+        left_frown_active = 'mouthFrownLeft' in thresholds and left_frown > thresholds['mouthFrownLeft']['threshold']
+        right_frown_active = 'mouthFrownRight' in thresholds and right_frown > thresholds['mouthFrownRight']['threshold']
+        
+        if left_frown_active or right_frown_active:
+            display_label = thresholds.get('mouthFrownLeft', thresholds.get('mouthFrownRight', {})).get('display_name', 'Sad / Concerned')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # 5. Nose Wrinkling / Sneer: Distance between nose bridge and upper lip for Disgust
+    if 'noseSneerLeft' in thresholds or 'noseSneerRight' in thresholds:
+        nose_dist = abs(landmarks[197].y - landmarks[0].y)
+        
+        left_sneer_active = 'noseSneerLeft' in thresholds and nose_dist < thresholds['noseSneerLeft']['threshold']
+        right_sneer_active = 'noseSneerRight' in thresholds and nose_dist < thresholds['noseSneerRight']['threshold']
+        
+        if left_sneer_active or right_sneer_active:
+            display_label = thresholds.get('noseSneerLeft', thresholds.get('noseSneerRight', {})).get('display_name', 'Disgust')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # 6. Neutral Fallback: Default status when face is present but no expressive threshold is triggered
+    if not active_emotions and 'faceNeutral' in thresholds:
+        active_emotions.append(thresholds['faceNeutral']['display_name'])
 
     return active_emotions
 
