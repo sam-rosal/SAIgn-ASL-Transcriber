@@ -41,7 +41,7 @@ def extract_video_landmarks(video_path):
     detected joint spatial coordinates into a structured NumPy matrix.
 
     Output matrix shape: (total_frames, 126)
-    - 2 hands * 21 landmarks * 3 coordinates (x, y, z) = 126 float values per frame.
+- 2 hands * 21 landmarks * 3 coordinates (x, y, z) = 126 float values per frame.
     """
     cap = cv2.VideoCapture(video_path)
     video_features = []
@@ -82,7 +82,7 @@ def apply_velocity_segmentation(features, threshold=VELOCITY_THRESHOLD, min_fram
     by computing frame-to-frame Euclidean landmark displacement (velocity).
 
     Mathematical Pipeline:
-    1. Calculate delta vector between adjacent time steps: ΔF = F[t] - F[t-1]
+1. Calculate delta vector between adjacent time steps: ΔF = F[t] - F[t-1]
     2. Compute L2 norm (magnitude) of ΔF across landmark dimensions.
     3. Retain frames where spatial displacement meets or exceeds the velocity threshold.
     """
@@ -116,7 +116,7 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
     using 1D linear temporal interpolation across the time axis.
 
     Mathematical Pipeline:
-    1. Map original sequence indices [0, ..., T-1] to normalized timeline [0.0, 1.0].
+1. Map original sequence indices [0, ..., T-1] to normalized timeline [0.0, 1.0].
     2. Generate target timeline [0.0, 1.0] with exactly target_frames steps.
     3. Linearly interpolate features across time axis (axis=0) to standardize shape.
     """
@@ -177,7 +177,13 @@ def register_and_process_dataset():
                 LIMIT 1
             """, (video_file, f"%{yt_id}%"))
             result = cursor.fetchone()
-            split_tag = result[0] if result else 'train'
+            
+            # Guardrail against silent split contamination: Skip clip if missing from video_clips metadata
+            if not result:
+                print(f"[WARN] No matching metadata in video_clips for: {video_file}. Skipping processing...")
+                continue
+
+            split_tag = result[0]
 
             print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
             

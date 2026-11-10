@@ -7,3 +7,15 @@ __pycache__/
 extracted_features/
 media_dataset/
 mediapipe_env/
+.venv/
+media_dataset/
+extracted_features/
+*.keras
+*.db
+.DS_Store
+.venv/
+media_dataset/
+extracted_features/
+*.keras
+*.db
+.DS_Store

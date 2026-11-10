@@ -77,14 +77,23 @@ def init_system():
             VALUES (?, ?, ?);
         """, gestures_seed)
     
+<<<<<<< HEAD
+=======
     # 4. Seed active non-manual facial expression markers
+>>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
 # 4. Seed active non-manual facial expression markers
     expressions_seed = [
         ('mouthSmileLeft', 'Happy', 0.12),
         ('mouthSmileRight', 'Happy', 0.12),
+<<<<<<< HEAD
+        ('browInnerUp', 'Surprised', 0.035),
+        ('browLowerer', 'Angry', 0.025),
+        ('browSquint', 'Confused / Question', 0.020),
+=======
         ('browInnerUp', 'Question', 0.035),
         ('browLowerer', 'Angry', 0.025),
         ('browSquint', 'Confused', 0.020),
+>>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
         ('mouthFrownLeft', 'Sad / Concerned', 0.030),
         ('mouthFrownRight', 'Sad / Concerned', 0.030),
         ('noseSneerLeft', 'Disgust', 0.025),
