@@ -56,10 +56,17 @@ def run_benchmark():
         output_filename = 'confusion_matrix_val.png'
         print("\n--> Launching Validation Benchmark...")
     elif choice == '2':
+        print("\n[WARNING] You have selected the FINAL TEST holdout split.")
+        print("This split should only be evaluated once at the very end of the project cycle.")
+        confirm = input("Are you sure you want to proceed? (y/n): ").strip().lower()
+        
+        if confirm != 'y':
+            print("\nTest benchmark cancelled. Returning safely.")
+            return
+            
         target_split = 'test'
         output_filename = 'confusion_matrix_test.png'
         print("\n--> Launching Final Test Benchmark...")
-        print("WARNING: This should only be run to verify final performance.")
     else:
         print("\nInvalid selection. Exiting.")
         return
