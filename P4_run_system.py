@@ -87,10 +87,6 @@ def detect_expressions(results, thresholds):
         if inner_brow > thresholds['browInnerUp']['threshold']:
             active_emotions.append(thresholds['browInnerUp']['display_name'])
 
-<<<<<<< HEAD
-=======
-    # 3. Smiling: Distance between left corner and right corner of lips
->>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
     if 'mouthSmileLeft' in thresholds or 'mouthSmileRight' in thresholds:
         left_smile = abs(landmarks[61].x - landmarks[13].x)
         right_smile = abs(landmarks[291].x - landmarks[13].x)
@@ -103,10 +99,6 @@ def detect_expressions(results, thresholds):
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
-<<<<<<< HEAD
-=======
-    # 4. Mouth Frowning: Distance between lip corners and mouth center for Sad / Concerned
->>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
     if 'mouthFrownLeft' in thresholds or 'mouthFrownRight' in thresholds:
         left_frown = landmarks[61].y - landmarks[17].y
         right_frown = landmarks[291].y - landmarks[17].y
@@ -119,10 +111,6 @@ def detect_expressions(results, thresholds):
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
-<<<<<<< HEAD
-=======
-    # 5. Nose Wrinkling / Sneer: Distance between nose bridge and upper lip for Disgust
->>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
     if 'noseSneerLeft' in thresholds or 'noseSneerRight' in thresholds:
         nose_dist = abs(landmarks[197].y - landmarks[0].y)
         
@@ -134,10 +122,6 @@ def detect_expressions(results, thresholds):
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
-<<<<<<< HEAD
-=======
-    # 6. Neutral Fallback: Default status when face is present but no expressive threshold is triggered
->>>>>>> fe4c11ff55b65358a722b70e228955080a49e418
     if not active_emotions and 'faceNeutral' in thresholds:
         active_emotions.append(thresholds['faceNeutral']['display_name'])
 

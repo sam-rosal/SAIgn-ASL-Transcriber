@@ -116,6 +116,12 @@ def register_and_process_dataset():
             feature_filename = f"{os.path.splitext(video_file)[0]}_landmarks.npy"
             output_feature_path = os.path.join(FEATURES_DIR, feature_filename)
             
+            # --- NEW ADDITION: Check file system before processing ---
+            if os.path.exists(output_feature_path):
+                print(f"Skipping {video_file} - features already extracted.")
+                continue
+            # ---------------------------------------------------------
+            
             yt_id = video_file.split('_')[0] if '_' in video_file else video_file
             cursor.execute("""
                 SELECT split FROM video_clips 
