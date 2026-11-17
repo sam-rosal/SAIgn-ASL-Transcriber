@@ -18,7 +18,6 @@ SEQUENCE_LENGTH = 30
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
 
-
 # ==============================================================================
 # HELPER FUNCTIONS: DATABASE & DATA PROCESSING
 # ==============================================================================
@@ -75,58 +74,95 @@ def detect_expressions(results, thresholds):
 
     landmarks = results.face_landmarks.landmark
 
+    # Brow furrow / squint (check stricter threshold 0.020 before 0.025)
     if 'browLowerer' in thresholds or 'browSquint' in thresholds:
         brow_dist = abs(landmarks[70].y - landmarks[159].y)
-        if 'browLowerer' in thresholds and brow_dist < thresholds['browLowerer']['threshold']:
-            active_emotions.append(thresholds['browLowerer']['display_name'])
-        elif 'browSquint' in thresholds and brow_dist < thresholds['browSquint']['threshold']:
+        if 'browSquint' in thresholds and brow_dist < thresholds['browSquint']['threshold']:
             active_emotions.append(thresholds['browSquint']['display_name'])
+        elif 'browLowerer' in thresholds and brow_dist < thresholds['browLowerer']['threshold']:
+            active_emotions.append(thresholds['browLowerer']['display_name'])
 
+    # Inner brow raise
     if 'browInnerUp' in thresholds:
         inner_brow = abs(landmarks[55].y - landmarks[6].y)
         if inner_brow > thresholds['browInnerUp']['threshold']:
             active_emotions.append(thresholds['browInnerUp']['display_name'])
 
+    # Eye aperture (shared between eyeWide and eyeSquint)
+    left_eye_open = abs(landmarks[159].y - landmarks[145].y)
+    right_eye_open = abs(landmarks[386].y - landmarks[374].y)
+
+    if 'eyeWideLeft' in thresholds or 'eyeWideRight' in thresholds:
+        left_wide = 'eyeWideLeft' in thresholds and left_eye_open > thresholds['eyeWideLeft']['threshold']
+        right_wide = 'eyeWideRight' in thresholds and right_eye_open > thresholds['eyeWideRight']['threshold']
+        if left_wide or right_wide:
+            display_label = thresholds.get('eyeWideLeft', thresholds.get('eyeWideRight', {})).get('display_name', 'Fearful / Startled')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    if 'eyeSquintLeft' in thresholds or 'eyeSquintRight' in thresholds:
+        left_squint = 'eyeSquintLeft' in thresholds and left_eye_open < thresholds['eyeSquintLeft']['threshold']
+        right_squint = 'eyeSquintRight' in thresholds and right_eye_open < thresholds['eyeSquintRight']['threshold']
+        if left_squint or right_squint:
+            display_label = thresholds.get('eyeSquintLeft', thresholds.get('eyeSquintRight', {})).get('display_name', 'Suspicious / Wincing')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # Smile
     if 'mouthSmileLeft' in thresholds or 'mouthSmileRight' in thresholds:
         left_smile = abs(landmarks[61].x - landmarks[13].x)
         right_smile = abs(landmarks[291].x - landmarks[13].x)
-        
+
         left_active = 'mouthSmileLeft' in thresholds and left_smile > thresholds['mouthSmileLeft']['threshold']
         right_active = 'mouthSmileRight' in thresholds and right_smile > thresholds['mouthSmileRight']['threshold']
-        
+
         if left_active or right_active:
             display_label = thresholds.get('mouthSmileLeft', thresholds.get('mouthSmileRight', {})).get('display_name', 'Happy')
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
+    # Frown
     if 'mouthFrownLeft' in thresholds or 'mouthFrownRight' in thresholds:
         left_frown = landmarks[61].y - landmarks[17].y
         right_frown = landmarks[291].y - landmarks[17].y
-        
+
         left_frown_active = 'mouthFrownLeft' in thresholds and left_frown > thresholds['mouthFrownLeft']['threshold']
         right_frown_active = 'mouthFrownRight' in thresholds and right_frown > thresholds['mouthFrownRight']['threshold']
-        
+
         if left_frown_active or right_frown_active:
             display_label = thresholds.get('mouthFrownLeft', thresholds.get('mouthFrownRight', {})).get('display_name', 'Sad / Concerned')
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
+    # Jaw drop / open mouth
+    if 'jawOpen' in thresholds:
+        mouth_open = abs(landmarks[14].y - landmarks[13].y)
+        if mouth_open > thresholds['jawOpen']['threshold']:
+            active_emotions.append(thresholds['jawOpen']['display_name'])
+
+    # Mouth pucker / horizontal narrowing
+    if 'mouthPucker' in thresholds:
+        mouth_width = abs(landmarks[291].x - landmarks[61].x)
+        if mouth_width < thresholds['mouthPucker']['threshold']:
+            active_emotions.append(thresholds['mouthPucker']['display_name'])
+
+    # Nose sneer
     if 'noseSneerLeft' in thresholds or 'noseSneerRight' in thresholds:
         nose_dist = abs(landmarks[197].y - landmarks[0].y)
-        
+
         left_sneer_active = 'noseSneerLeft' in thresholds and nose_dist < thresholds['noseSneerLeft']['threshold']
         right_sneer_active = 'noseSneerRight' in thresholds and nose_dist < thresholds['noseSneerRight']['threshold']
-        
+
         if left_sneer_active or right_sneer_active:
             display_label = thresholds.get('noseSneerLeft', thresholds.get('noseSneerRight', {})).get('display_name', 'Disgust')
             if display_label not in active_emotions:
                 active_emotions.append(display_label)
 
+    # Neutral fallback
     if not active_emotions and 'faceNeutral' in thresholds:
         active_emotions.append(thresholds['faceNeutral']['display_name'])
 
     return active_emotions
-
 
 # ==============================================================================
 # GUI SCREENS & STATE MANAGERS
