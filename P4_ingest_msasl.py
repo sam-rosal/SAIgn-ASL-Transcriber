@@ -1,19 +1,22 @@
 import json
+import os
 import sqlite3
 
-# Define database name
-DB_NAME = 'saign_vision.db'
+# Define paths anchored to the script directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 
 # Define input split files
 json_files = {
-    'train': 'MSASL_train.json',
-    'val': 'MSASL_val.json',
-    'test': 'MSASL_test.json'
+    'train': os.path.join(SCRIPT_DIR, 'MSASL_train.json'),
+    'val': os.path.join(SCRIPT_DIR, 'MSASL_val.json'),
+    'test': os.path.join(SCRIPT_DIR, 'MSASL_test.json')
 }
+
 
 def ingest_data():
     """Reads JSON files and populates the SQLite database table."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     # Create target table if it doesn't exist
@@ -78,9 +81,10 @@ def ingest_data():
     conn.commit()
     conn.close()
 
+
 def print_split_percentages():
     """Queries the database and displays the distribution of train/val/test splits."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
     query = '''
@@ -101,6 +105,7 @@ def print_split_percentages():
         print(f"Error reading database: {e}")
     finally:
         conn.close()
+
 
 if __name__ == '__main__':
     ingest_data()

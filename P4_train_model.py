@@ -118,18 +118,24 @@ def register_and_process_dataset():
             if os.path.exists(output_feature_path):
                 continue
             
-            yt_id = video_file.split('_')[0] if '_' in video_file else video_file
-            cursor.execute("""
-                SELECT split FROM video_clips 
-                WHERE file_title = ? OR url LIKE ? 
-                LIMIT 1
-            """, (video_file, f"%{yt_id}%"))
-            result = cursor.fetchone()
-            
-            if not result:
-                continue
+            # Parse <tag> directly from <sign>_<number>_<tag>.mp4, with DB fallback for legacy names
+            stem_parts = os.path.splitext(video_file)[0].split('_')
+            if len(stem_parts) >= 3 and stem_parts[-1].lower() in ('train', 'val', 'test'):
+                split_tag = stem_parts[-1].lower()
+            else:
+                yt_id = stem_parts[0]
+                cursor.execute("""
+                    SELECT split FROM video_clips 
+                    WHERE file_title = ? OR url LIKE ? 
+                    LIMIT 1
+                """, (video_file, f"%{yt_id}%"))
+                result = cursor.fetchone()
+                
+                if not result:
+                    continue
 
-            split_tag = result[0]
+                split_tag = result[0]
+
             raw_features = extract_video_landmarks(video_path)
             if len(raw_features) == 0: 
                 continue
@@ -156,6 +162,7 @@ def load_split_data(split_name, db_path=DB_PATH):
     data = cursor.execute(query, (split_name,)).fetchall()
     conn.close()
     return data
+
 
 def prepare_tensors(data_list):
     """

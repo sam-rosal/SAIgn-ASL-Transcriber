@@ -116,25 +116,29 @@ def register_and_process_dataset():
             feature_filename = f"{os.path.splitext(video_file)[0]}_landmarks.npy"
             output_feature_path = os.path.join(FEATURES_DIR, feature_filename)
             
-            # --- NEW ADDITION: Check file system before processing ---
+            # Check file system before processing
             if os.path.exists(output_feature_path):
                 print(f"Skipping {video_file} - features already extracted.")
                 continue
-            # ---------------------------------------------------------
             
-            yt_id = video_file.split('_')[0] if '_' in video_file else video_file
-            cursor.execute("""
-                SELECT split FROM video_clips 
-                WHERE file_title = ? OR url LIKE ? 
-                LIMIT 1
-            """, (video_file, f"%{yt_id}%"))
-            result = cursor.fetchone()
-            
-            if not result:
-                print(f"[WARN] No matching metadata in video_clips for: {video_file}. Skipping processing...")
-                continue
+            # Parse <tag> directly from <sign>_<number>_<tag>.mp4, with DB fallback for legacy names
+            stem_parts = os.path.splitext(video_file)[0].split('_')
+            if len(stem_parts) >= 3 and stem_parts[-1].lower() in ('train', 'val', 'test'):
+                split_tag = stem_parts[-1].lower()
+            else:
+                yt_id = stem_parts[0]
+                cursor.execute("""
+                    SELECT split FROM video_clips 
+                    WHERE file_title = ? OR url LIKE ? 
+                    LIMIT 1
+                """, (video_file, f"%{yt_id}%"))
+                result = cursor.fetchone()
+                
+                if not result:
+                    print(f"[WARN] No matching metadata in video_clips for: {video_file}. Skipping processing...")
+                    continue
 
-            split_tag = result[0]
+                split_tag = result[0]
 
             print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
             
@@ -156,6 +160,7 @@ def register_and_process_dataset():
     conn.commit()
     conn.close()
     print("\nHolistic feature extraction & 30-Frame Resampling complete! 225-dimension entries logged.")
+
 
 if __name__ == "__main__":
     register_and_process_dataset()

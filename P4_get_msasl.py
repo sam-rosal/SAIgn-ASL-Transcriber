@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import sqlite3
 import subprocess
 from collections import defaultdict
 
@@ -8,7 +9,9 @@ from collections import defaultdict
 # SYSTEM & DIRECTORY CONFIGURATION
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MEDIA_DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
+MANIFEST_PATH = os.path.join(MEDIA_DATASET_DIR, '.msasl_download_manifest.json')
 
 JSON_FILES = [
     os.path.join(SCRIPT_DIR, 'MSASL_train.json'),
@@ -18,6 +21,7 @@ JSON_FILES = [
 
 MIN_VIDEOS_PER_CLASS = 3
 BATCH_SIZE_CLASSES = 10  # Process 10 sign classes per execution run
+VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
 
 
 def get_youtube_id(url):
@@ -29,19 +33,64 @@ def get_youtube_id(url):
     return match.group(1) if match else None
 
 
-def get_clip_filename(entry, idx):
-    """Generates deterministic filename for a video clip."""
+def get_clip_key(entry, idx):
+    """Generates a unique identifier for a metadata entry to avoid duplicate downloads."""
     url = entry.get('url', '')
     start_time = entry.get('start_time', 0)
     end_time = entry.get('end_time', 0)
-    
+
     yt_id = get_youtube_id(url)
     if yt_id:
         start_sec = int(float(start_time))
         end_sec = int(float(end_time))
-        return f"{yt_id}_{start_sec}_{end_sec}.mp4"
-    else:
-        return f"msasl_{idx}_{entry.get('split', 'train')}.mp4"
+        return f"{yt_id}_{start_sec}_{end_sec}"
+    return f"msasl_{idx}_{entry.get('split', 'train')}"
+
+
+def load_download_manifest():
+    """Loads the record of already-downloaded clip keys mapped to their local filenames."""
+    if os.path.exists(MANIFEST_PATH):
+        try:
+            with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_download_manifest(manifest):
+    """Persists the download manifest to disk."""
+    os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
+    with open(MANIFEST_PATH, 'w', encoding='utf-8') as f:
+        json.dump(manifest, f, indent=2)
+
+
+def load_db_split_tags():
+    """
+    Loads (clean_text, url, start_time, end_time) -> split tag mappings from
+    saign_vision.db (populated by P4_ingest_msasl_5.py).
+    """
+    tag_lookup = {}
+    if not os.path.exists(DB_PATH):
+        return tag_lookup
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT clean_text, url, start_time, end_time, split
+            FROM video_clips
+            WHERE split IS NOT NULL
+        """)
+        for clean_text, url, start_time, end_time, split in cursor.fetchall():
+            norm_text = (clean_text or "").strip().lower().replace(" ", "_")
+            key = (norm_text, url, round(float(start_time or 0), 3), round(float(end_time or 0), 3))
+            tag_lookup[key] = split.strip().lower()
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+    return tag_lookup
 
 
 def get_existing_folders():
@@ -60,13 +109,44 @@ def count_local_videos(folder_path):
     """Counts total playable video files currently stored in a given local directory."""
     if not os.path.exists(folder_path):
         return 0
-    valid_exts = ('.mp4', '.avi', '.mov', '.mkv')
-    return len([f for f in os.listdir(folder_path) if f.lower().endswith(valid_exts)])
+    return len([f for f in os.listdir(folder_path) if f.lower().endswith(VALID_VIDEO_EXTS)])
+
+
+def get_next_video_number(folder_path, sign_name):
+    """
+    Determines the next sequential video number (1, 2, 3, ...) for a sign folder,
+    accounting for any existing videos already on disk.
+    """
+    if not os.path.exists(folder_path):
+        return 1
+
+    pattern = re.compile(rf"^{re.escape(sign_name)}_(\d+)_[^.]+", re.IGNORECASE)
+    max_num = 0
+    total_videos = 0
+
+    for fname in os.listdir(folder_path):
+        if fname.lower().endswith(VALID_VIDEO_EXTS):
+            total_videos += 1
+            match = pattern.match(os.path.splitext(fname)[0])
+            if match:
+                max_num = max(max_num, int(match.group(1)))
+
+    return max(max_num, total_videos) + 1
+
+
+def is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
+    """Checks if a clip is already recorded in the manifest and present on disk."""
+    saved_filename = manifest.get(folder_name, {}).get(clip_key)
+    if saved_filename and os.path.exists(os.path.join(folder_path, saved_filename)):
+        return True
+    return False
 
 
 def load_and_filter_metadata(min_samples=3):
-    """Parses MS-ASL JSON files and filters gesture classes by min sample count."""
+    """Parses MS-ASL JSON files, resolves split tags, and filters classes by min sample count."""
     existing_folders = get_existing_folders()
+    db_tags = load_db_split_tags()
+    manifest = load_download_manifest()
     class_to_entries = defaultdict(list)
     total_entries = 0
 
@@ -74,20 +154,32 @@ def load_and_filter_metadata(min_samples=3):
         if not os.path.exists(json_path):
             print(f"[WARN] Partition metadata file not found: {json_path}. Skipping...")
             continue
-        
+
+        if 'train' in os.path.basename(json_path).lower():
+            file_split = 'train'
+        elif 'val' in os.path.basename(json_path).lower():
+            file_split = 'val'
+        elif 'test' in os.path.basename(json_path).lower():
+            file_split = 'test'
+        else:
+            file_split = 'train'
+
         with open(json_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
             for entry in data:
-                if 'train' in json_path:
-                    entry['split'] = 'train'
-                elif 'val' in json_path:
-                    entry['split'] = 'val'
-                elif 'test' in json_path:
-                    entry['split'] = 'test'
-                else:
-                    entry['split'] = 'train'
+                raw_text = entry.get('clean_text', entry.get('text', '')).strip().lower().replace(" ", "_")
+                if not raw_text:
+                    continue
 
-                raw_text = entry.get('clean_text', entry.get('text')).strip().lower().replace(" ", "_")
+                # Prefer the split tag ingested in P4_ingest_msasl_5, fallback to source JSON split
+                db_key = (
+                    raw_text,
+                    entry.get('url', ''),
+                    round(float(entry.get('start_time', 0) or 0), 3),
+                    round(float(entry.get('end_time', 0) or 0), 3)
+                )
+                entry['split'] = db_tags.get(db_key, file_split)
+
                 target_folder_name = existing_folders.get(raw_text, raw_text)
                 entry['target_folder'] = target_folder_name
 
@@ -102,12 +194,11 @@ def load_and_filter_metadata(min_samples=3):
     for folder_name, entries in class_to_entries.items():
         folder_path = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(folder_path)
-        
-        # Count how many entries are not yet downloaded on disk
+
         pending_count = 0
         for idx, entry in enumerate(entries):
-            fname = get_clip_filename(entry, idx)
-            if not os.path.exists(os.path.join(folder_path, fname)):
+            clip_key = get_clip_key(entry, idx)
+            if not is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
                 pending_count += 1
 
         total_potential = existing_count + pending_count
@@ -127,7 +218,7 @@ def load_and_filter_metadata(min_samples=3):
 def download_clip(url, start_time, end_time, output_path):
     """Streams and trims YouTube clip with yt-dlp + ffmpeg."""
     if os.path.exists(output_path):
-        return True  
+        return True
 
     cmd = [
         "yt-dlp",
@@ -148,7 +239,7 @@ def download_clip(url, start_time, end_time, output_path):
 
 
 def fetch_msasl_dataset():
-    """Main execution loop: downloads clips in batches of 10 sign classes at a time."""
+    """Main execution loop: downloads clips in batches and names them <sign>_<number>_<tag>.mp4."""
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
     valid_dataset = load_and_filter_metadata(min_samples=MIN_VIDEOS_PER_CLASS)
 
@@ -156,19 +247,20 @@ def fetch_msasl_dataset():
         print("No valid classes found.")
         return
 
+    manifest = load_download_manifest()
+
     # Identify classes that still have pending downloads
     classes_with_pending = []
     for folder_name, entries in valid_dataset.items():
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(label_dir)
-        
+
         pending = []
         for idx, entry in enumerate(entries):
-            fname = get_clip_filename(entry, idx)
-            fpath = os.path.join(label_dir, fname)
-            if not os.path.exists(fpath):
-                pending.append((entry, fname, fpath))
-        
+            clip_key = get_clip_key(entry, idx)
+            if not is_clip_downloaded(folder_name, label_dir, clip_key, manifest):
+                pending.append((entry, clip_key))
+
         if pending:
             classes_with_pending.append({
                 'folder_name': folder_name,
@@ -195,19 +287,30 @@ def fetch_msasl_dataset():
         folder_name = item['folder_name']
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
         os.makedirs(label_dir, exist_ok=True)
+        manifest.setdefault(folder_name, {})
+
+        next_num = get_next_video_number(label_dir, folder_name)
 
         print(f"[{c_idx}/{len(batch_classes)}] Sign Class: '{folder_name}' (Existing on disk: {item['existing_count']}, Pending in batch: {len(item['pending'])})")
 
         success_count = 0
-        for entry, file_name, output_path in item['pending']:
+        for entry, clip_key in item['pending']:
             url = entry['url']
             start_time = entry.get('start_time', 0)
             end_time = entry.get('end_time', 0)
+            tag = entry.get('split', 'train')
+
+            # Format: <sign>_<number>_<tag>.mp4 (e.g., hello_1_train.mp4)
+            file_name = f"{folder_name}_{next_num}_{tag}.mp4"
+            output_path = os.path.join(label_dir, file_name)
 
             success = download_clip(url, start_time, end_time, output_path)
             if success:
+                manifest[folder_name][clip_key] = file_name
                 success_count += 1
+                next_num += 1
 
+        save_download_manifest(manifest)
         total_now = count_local_videos(label_dir)
         print(f"   -> Successfully downloaded {success_count}/{len(item['pending'])} new clips. Current total in folder: {total_now}\n")
 
@@ -215,7 +318,7 @@ def fetch_msasl_dataset():
     print("--- Batch Execution Summary ---")
     if remaining_classes > 0:
         print(f"Batch completed! There are {remaining_classes} more sign classes with pending downloads.")
-        print("Run 'python get_msasl.py' again to process the next batch of 10 sign classes.")
+        print("Run 'python P4_get_msasl_5.py' again to process the next batch of 10 sign classes.")
     else:
         print("All pending sign classes across the dataset have been processed!")
 
