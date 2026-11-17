@@ -7,10 +7,10 @@ from scipy.interpolate import interp1d
 
 # --- NEW IMPORTS FOR MODEL TRAINING ---
 import tensorflow as tf
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.callbacks import EarlyStopping
-from tensorflow.keras.utils import to_categorical
+from keras.models import Model
+from keras.layers import Input, LSTM, Dense, Dropout, Attention, GlobalAveragePooling1D
+from keras.callbacks import EarlyStopping
+from keras.utils import to_categorical
 from sklearn.preprocessing import LabelEncoder
 
 # --- System & Path Configurations ---
@@ -209,15 +209,24 @@ if __name__ == "__main__":
     sequence_length = X_train.shape[1]  # 30 frames
     feature_dim = X_train.shape[2]      # Dynamically sets to 225 based on Holistic extraction
 
-    # Step 5: Define LSTM Architecture
-    print("\n--- Building LSTM Neural Network ---")
-    model = Sequential([
-        LSTM(64, return_sequences=True, activation='relu', input_shape=(sequence_length, feature_dim)),
-        LSTM(128, return_sequences=False, activation='relu'),
-        Dropout(0.2),
-        Dense(64, activation='relu'),
-        Dense(num_classes, activation='softmax')
-    ])
+    # Step 5: Define LSTM + Temporal Attention Architecture
+    print("\n--- Building LSTM + Attention Neural Network ---")
+    inputs = Input(shape=(sequence_length, feature_dim))
+    
+    # Recurrent layers retain full 30-step temporal sequences (return_sequences=True)
+    x = LSTM(64, return_sequences=True)(inputs)
+    x = LSTM(128, return_sequences=True)(x)
+    
+    # Self-Attention layer weights key gesture frames across the 30-frame window
+    attention_out = Attention()([x, x])
+    
+    # Condense temporal sequence into a single context vector before classification
+    x = GlobalAveragePooling1D()(attention_out)
+    x = Dropout(0.2)(x)
+    x = Dense(64, activation='relu')(x)
+    outputs = Dense(num_classes, activation='softmax')(x)
+
+    model = Model(inputs=inputs, outputs=outputs)
 
     model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
 
