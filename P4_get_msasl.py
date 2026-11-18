@@ -12,6 +12,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MEDIA_DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
 MANIFEST_PATH = os.path.join(MEDIA_DATASET_DIR, '.msasl_download_manifest.json')
+PRIORITY_FILE_PATH = os.path.join(SCRIPT_DIR, 'priority_signs.txt')
 
 JSON_FILES = [
     os.path.join(SCRIPT_DIR, 'MSASL_train.json'),
@@ -22,6 +23,74 @@ JSON_FILES = [
 MIN_VIDEOS_PER_CLASS = 3
 BATCH_SIZE_CLASSES = 10  # Process 10 sign classes per execution run
 VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
+
+# Set to True to download ONLY signs listed in priority_signs.txt and ignore the rest of MS-ASL
+ONLY_DOWNLOAD_PRIORITY = False
+
+# Used strictly to auto-create priority_signs.txt on first run if the file does not exist
+DEFAULT_PRIORITY_VOCAB = {
+    "1. Greetings & Courtesies": [
+        "hello", "goodbye", "please", "thank_you", "thanks",
+        "youre_welcome", "welcome", "sorry", "excuse_me", "nice_to_meet_you"
+    ],
+    "2. Pronouns & People": [
+        "i", "me", "you", "he", "she", "it", "we", "us", "they", "them",
+        "friend", "family", "name", "person", "man", "woman"
+    ],
+    "3. Question Words": [
+        "who", "what", "where", "when", "why", "how", "which"
+    ],
+    "4. Everyday Verbs & Actions": [
+        "want", "need", "help", "like", "know", "understand", "think",
+        "go", "come", "work", "learn", "stop", "wait", "finish", "done",
+        "make", "see", "look", "have", "give", "take"
+    ],
+    "5. Responses & Descriptors": [
+        "yes", "no", "good", "bad", "happy", "sad", "fine", "more", "same"
+    ],
+    "6. Time & Connectors": [
+        "today", "now", "tomorrow", "yesterday", "time"
+    ],
+}
+
+
+def write_default_priority_file(file_path):
+    """Formats DEFAULT_PRIORITY_VOCAB into a clean, commented priority_signs.txt file."""
+    lines = [
+        "# SAIgn Conversational Priority Vocabulary",
+        "# Signs listed higher are downloaded first. Lines starting with '#' are ignored.\n"
+    ]
+    for category, signs in DEFAULT_PRIORITY_VOCAB.items():
+        lines.append(f"# {category}")
+        lines.extend(signs)
+        lines.append("")
+
+    with open(file_path, 'w', encoding='utf-8') as f:
+        f.write("\n".join(lines).strip() + "\n")
+
+
+def load_priority_map(file_path=PRIORITY_FILE_PATH):
+    """
+    Loads priority signs from an external text file into an O(1) rank lookup dictionary.
+    Auto-generates priority_signs.txt on first run if missing.
+    """
+    if not os.path.exists(file_path):
+        write_default_priority_file(file_path)
+        print(f"[INFO] Created default priority list at: {file_path}")
+
+    priority_map = {}
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for raw_line in f:
+            # Strip inline comments and whitespace
+            clean_line = raw_line.split('#', 1)[0].strip()
+            if not clean_line:
+                continue
+
+            normalized = clean_line.lower().replace(" ", "_")
+            if normalized not in priority_map:
+                priority_map[normalized] = len(priority_map)
+
+    return priority_map
 
 
 def get_youtube_id(url):
@@ -68,7 +137,7 @@ def save_download_manifest(manifest):
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_5.py).
+    saign_vision.db (populated by P4_ingest_msasl_4.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -142,7 +211,7 @@ def is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
     return False
 
 
-def load_and_filter_metadata(min_samples=3):
+def load_and_filter_metadata(priority_map, min_samples=3):
     """Parses MS-ASL JSON files, resolves split tags, and filters classes by min sample count."""
     existing_folders = get_existing_folders()
     db_tags = load_db_split_tags()
@@ -171,7 +240,10 @@ def load_and_filter_metadata(min_samples=3):
                 if not raw_text:
                     continue
 
-                # Prefer the split tag ingested in P4_ingest_msasl_5, fallback to source JSON split
+                if ONLY_DOWNLOAD_PRIORITY and raw_text not in priority_map:
+                    continue
+
+                # Prefer the split tag ingested in P4_ingest_msasl_4, fallback to source JSON split
                 db_key = (
                     raw_text,
                     entry.get('url', ''),
@@ -208,8 +280,9 @@ def load_and_filter_metadata(min_samples=3):
         else:
             discarded_classes += 1
 
+    priority_matches = sum(1 for k in valid_dataset if k.lower().replace(" ", "_") in priority_map)
     print(f"\n--- Pre-Download Filtering ---")
-    print(f"Classes meeting >= {min_samples} total possible video requirement: {len(valid_dataset)}")
+    print(f"Classes meeting >= {min_samples} total possible video requirement: {len(valid_dataset)} ({priority_matches} priority signs matched)")
     print(f"Classes discarded: {discarded_classes}")
 
     return valid_dataset
@@ -239,21 +312,27 @@ def download_clip(url, start_time, end_time, output_path):
 
 
 def fetch_msasl_dataset():
-    """Main execution loop: downloads clips in batches and names them <sign>_<number>_<tag>.mp4."""
+    """Main execution loop: reads priority_signs.txt, downloads priority classes first, then general classes."""
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
-    valid_dataset = load_and_filter_metadata(min_samples=MIN_VIDEOS_PER_CLASS)
+    priority_map = load_priority_map(PRIORITY_FILE_PATH)
+    print(f"Loaded {len(priority_map)} priority signs from {os.path.basename(PRIORITY_FILE_PATH)}.")
+
+    valid_dataset = load_and_filter_metadata(priority_map, min_samples=MIN_VIDEOS_PER_CLASS)
 
     if not valid_dataset:
         print("No valid classes found.")
         return
 
     manifest = load_download_manifest()
+    fallback_rank = len(priority_map)
 
     # Identify classes that still have pending downloads
     classes_with_pending = []
     for folder_name, entries in valid_dataset.items():
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(label_dir)
+        norm_name = folder_name.lower().replace(" ", "_")
+        is_priority = norm_name in priority_map
 
         pending = []
         for idx, entry in enumerate(entries):
@@ -265,6 +344,8 @@ def fetch_msasl_dataset():
             classes_with_pending.append({
                 'folder_name': folder_name,
                 'existing_count': existing_count,
+                'is_priority': is_priority,
+                'priority_rank': priority_map.get(norm_name, fallback_rank),
                 'pending': pending
             })
 
@@ -272,15 +353,24 @@ def fetch_msasl_dataset():
         print("\nAll eligible sign classes are already fully downloaded!")
         return
 
-    # Prioritize classes with < MIN_VIDEOS_PER_CLASS existing videos first
+    # Sort order:
+    # 1. Priority signs strictly before general signs
+    # 2. Classes with < MIN_VIDEOS_PER_CLASS existing clips first
+    # 3. Exact line order in priority_signs.txt (alphabetical fallback for general signs)
     classes_with_pending.sort(
-        key=lambda x: (x['existing_count'] >= MIN_VIDEOS_PER_CLASS, x['folder_name'])
+        key=lambda x: (
+            not x['is_priority'],
+            x['existing_count'] >= MIN_VIDEOS_PER_CLASS,
+            x['priority_rank'],
+            x['folder_name']
+        )
     )
 
     batch_classes = classes_with_pending[:BATCH_SIZE_CLASSES]
+    pending_priority_total = sum(1 for x in classes_with_pending if x['is_priority'])
 
     print(f"\n--- Starting Download Batch ---")
-    print(f"Total sign classes with pending downloads: {len(classes_with_pending)}")
+    print(f"Total sign classes with pending downloads: {len(classes_with_pending)} ({pending_priority_total} priority signs remaining)")
     print(f"Processing next {len(batch_classes)} sign classes in this batch...\n")
 
     for c_idx, item in enumerate(batch_classes, 1):
@@ -290,8 +380,9 @@ def fetch_msasl_dataset():
         manifest.setdefault(folder_name, {})
 
         next_num = get_next_video_number(label_dir, folder_name)
+        tier_tag = "[PRIORITY]" if item['is_priority'] else "[GENERAL]"
 
-        print(f"[{c_idx}/{len(batch_classes)}] Sign Class: '{folder_name}' (Existing on disk: {item['existing_count']}, Pending in batch: {len(item['pending'])})")
+        print(f"[{c_idx}/{len(batch_classes)}] {tier_tag} Sign Class: '{folder_name}' (Existing on disk: {item['existing_count']}, Pending in batch: {len(item['pending'])})")
 
         success_count = 0
         for entry, clip_key in item['pending']:
@@ -315,10 +406,11 @@ def fetch_msasl_dataset():
         print(f"   -> Successfully downloaded {success_count}/{len(item['pending'])} new clips. Current total in folder: {total_now}\n")
 
     remaining_classes = len(classes_with_pending) - len(batch_classes)
+    remaining_priority = sum(1 for x in classes_with_pending[BATCH_SIZE_CLASSES:] if x['is_priority'])
     print("--- Batch Execution Summary ---")
     if remaining_classes > 0:
-        print(f"Batch completed! There are {remaining_classes} more sign classes with pending downloads.")
-        print("Run 'python P4_get_msasl_5.py' again to process the next batch of 10 sign classes.")
+        print(f"Batch completed! Remaining classes: {remaining_classes} ({remaining_priority} priority signs left).")
+        print(f"Run 'python {os.path.basename(__file__)}' again to process the next batch of 10 sign classes.")
     else:
         print("All pending sign classes across the dataset have been processed!")
 
