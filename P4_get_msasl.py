@@ -27,7 +27,7 @@ VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
 # Set to True to download ONLY signs listed in priority_signs.txt and ignore the rest of MS-ASL
 ONLY_DOWNLOAD_PRIORITY = False
 
-# Used strictly to auto-generate priority_signs.txt on first run if the file does not exist
+# Used strictly to auto-create priority_signs.txt on first run if the file does not exist
 DEFAULT_PRIORITY_VOCAB = {
     "1. Greetings & Courtesies": [
         "hello", "goodbye", "please", "thank_you", "thanks",
@@ -50,6 +50,10 @@ DEFAULT_PRIORITY_VOCAB = {
     ],
     "6. Time & Connectors": [
         "today", "now", "tomorrow", "yesterday", "time"
+    ],
+    "7. Alphabet (Fingerspelling)": [
+        "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+        "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"
     ],
 }
 
