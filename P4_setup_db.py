@@ -78,6 +78,7 @@ def init_system():
         """, gestures_seed)
     
 # 4. Seed active non-manual facial expression markers
+# 4. Seed active non-manual facial expression markers
     expressions_seed = [
         ('mouthSmileLeft', 'Happy', 0.12),
         ('mouthSmileRight', 'Happy', 0.12),
@@ -88,6 +89,12 @@ def init_system():
         ('mouthFrownRight', 'Sad / Concerned', 0.030),
         ('noseSneerLeft', 'Disgust', 0.025),
         ('noseSneerRight', 'Disgust', 0.025),
+        ('jawOpen', 'Shocked / Gasping', 0.045),
+        ('eyeWideLeft', 'Fearful / Startled', 0.028),
+        ('eyeWideRight', 'Fearful / Startled', 0.028),
+        ('mouthPucker', 'Skeptical / Doubtful', 0.065),
+        ('eyeSquintLeft', 'Suspicious / Wincing', 0.012),
+        ('eyeSquintRight', 'Suspicious / Wincing', 0.012),
         ('faceNeutral', 'Neutral', 0.000)
     ]
     cursor.executemany("""
