@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import shutil
 import sqlite3
 import subprocess
 from collections import defaultdict
@@ -58,6 +59,12 @@ DEFAULT_PRIORITY_VOCAB = {
 }
 
 
+def sanitize_label(text):
+    """Normalizes sign text into a safe snake_case folder/file identifier."""
+    cleaned = (text or "").strip().lower().replace(" ", "_")
+    return re.sub(r'[\\/:*?"<>|]+', '_', cleaned)
+
+
 def write_default_priority_file(file_path):
     """Formats DEFAULT_PRIORITY_VOCAB into a clean, commented priority_signs.txt file."""
     lines = [
@@ -85,13 +92,12 @@ def load_priority_map(file_path=PRIORITY_FILE_PATH):
     priority_map = {}
     with open(file_path, 'r', encoding='utf-8') as f:
         for raw_line in f:
-            # Strip inline comments and whitespace
             clean_line = raw_line.split('#', 1)[0].strip()
             if not clean_line:
                 continue
 
-            normalized = clean_line.lower().replace(" ", "_")
-            if normalized not in priority_map:
+            normalized = sanitize_label(clean_line)
+            if normalized and normalized not in priority_map:
                 priority_map[normalized] = len(priority_map)
 
     return priority_map
@@ -102,22 +108,25 @@ def get_youtube_id(url):
     Extracts the unique 11-character YouTube video ID from a URL string.
     e.g., 'https://www.youtube.com/watch?v=dQw4w9WgXcQ' -> 'dQw4w9WgXcQ'
     """
+    if not isinstance(url, str) or not url:
+        return None
     match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
     return match.group(1) if match else None
 
 
 def get_clip_key(entry, idx):
     """Generates a unique identifier for a metadata entry to avoid duplicate downloads."""
-    url = entry.get('url', '')
-    start_time = entry.get('start_time', 0)
-    end_time = entry.get('end_time', 0)
+    url = entry.get('url') or ''
+    start_time = float(entry.get('start_time') or 0)
+    end_time = float(entry.get('end_time') or 0)
 
     yt_id = get_youtube_id(url)
     if yt_id:
-        start_sec = int(float(start_time))
-        end_sec = int(float(end_time))
+        start_sec = int(start_time)
+        end_sec = int(end_time)
         return f"{yt_id}_{start_sec}_{end_sec}"
-    return f"msasl_{idx}_{entry.get('split', 'train')}"
+    split_tag = entry.get('split') or 'train'
+    return f"msasl_{idx}_{split_tag}"
 
 
 def load_download_manifest():
@@ -125,7 +134,8 @@ def load_download_manifest():
     if os.path.exists(MANIFEST_PATH):
         try:
             with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
         except (json.JSONDecodeError, OSError):
             return {}
     return {}
@@ -141,12 +151,13 @@ def save_download_manifest(manifest):
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_4.py).
+    saign_vision.db (populated by P4_ingest_msasl_2.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
         return tag_lookup
 
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -156,12 +167,19 @@ def load_db_split_tags():
             WHERE split IS NOT NULL
         """)
         for clean_text, url, start_time, end_time, split in cursor.fetchall():
-            norm_text = (clean_text or "").strip().lower().replace(" ", "_")
-            key = (norm_text, url, round(float(start_time or 0), 3), round(float(end_time or 0), 3))
-            tag_lookup[key] = split.strip().lower()
-        conn.close()
+            norm_text = sanitize_label(clean_text)
+            key = (
+                norm_text,
+                url or '',
+                round(float(start_time or 0), 3),
+                round(float(end_time or 0), 3)
+            )
+            tag_lookup[key] = (split or 'train').strip().lower()
     except sqlite3.Error:
         pass
+    finally:
+        if conn:
+            conn.close()
 
     return tag_lookup
 
@@ -173,16 +191,22 @@ def get_existing_folders():
         for folder in os.listdir(MEDIA_DATASET_DIR):
             folder_path = os.path.join(MEDIA_DATASET_DIR, folder)
             if os.path.isdir(folder_path) and not folder.startswith('.'):
-                normalized_key = folder.lower().replace(" ", "_")
+                normalized_key = sanitize_label(folder)
                 folder_map[normalized_key] = folder
     return folder_map
 
 
 def count_local_videos(folder_path):
-    """Counts total playable video files currently stored in a given local directory."""
+    """Counts total non-empty playable video files currently stored in a local directory."""
     if not os.path.exists(folder_path):
         return 0
-    return len([f for f in os.listdir(folder_path) if f.lower().endswith(VALID_VIDEO_EXTS)])
+    count = 0
+    for f in os.listdir(folder_path):
+        if f.lower().endswith(VALID_VIDEO_EXTS):
+            fpath = os.path.join(folder_path, f)
+            if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                count += 1
+    return count
 
 
 def get_next_video_number(folder_path, sign_name):
@@ -208,10 +232,15 @@ def get_next_video_number(folder_path, sign_name):
 
 
 def is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
-    """Checks if a clip is already recorded in the manifest and present on disk."""
-    saved_filename = manifest.get(folder_name, {}).get(clip_key)
-    if saved_filename and os.path.exists(os.path.join(folder_path, saved_filename)):
-        return True
+    """Checks if a non-empty clip is already recorded in the manifest and present on disk."""
+    folder_manifest = manifest.get(folder_name)
+    if not isinstance(folder_manifest, dict):
+        return False
+    saved_filename = folder_manifest.get(clip_key)
+    if saved_filename:
+        full_path = os.path.join(folder_path, saved_filename)
+        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+            return True
     return False
 
 
@@ -228,39 +257,58 @@ def load_and_filter_metadata(priority_map, min_samples=3):
             print(f"[WARN] Partition metadata file not found: {json_path}. Skipping...")
             continue
 
-        if 'train' in os.path.basename(json_path).lower():
+        base_name = os.path.basename(json_path).lower()
+        if 'train' in base_name:
             file_split = 'train'
-        elif 'val' in os.path.basename(json_path).lower():
+        elif 'val' in base_name:
             file_split = 'val'
-        elif 'test' in os.path.basename(json_path).lower():
+        elif 'test' in base_name:
             file_split = 'test'
         else:
             file_split = 'train'
 
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            for entry in data:
-                raw_text = entry.get('clean_text', entry.get('text', '')).strip().lower().replace(" ", "_")
-                if not raw_text:
-                    continue
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] Failed to parse {json_path}: {e}. Skipping...")
+            continue
 
-                if ONLY_DOWNLOAD_PRIORITY and raw_text not in priority_map:
-                    continue
+        if not isinstance(data, list):
+            print(f"[WARN] Unexpected JSON format in {json_path}. Expected a list. Skipping...")
+            continue
 
-                # Prefer the split tag ingested in P4_ingest_msasl_4, fallback to source JSON split
-                db_key = (
-                    raw_text,
-                    entry.get('url', ''),
-                    round(float(entry.get('start_time', 0) or 0), 3),
-                    round(float(entry.get('end_time', 0) or 0), 3)
-                )
-                entry['split'] = db_tags.get(db_key, file_split)
+        for entry in data:
+            if not isinstance(entry, dict):
+                continue
 
-                target_folder_name = existing_folders.get(raw_text, raw_text)
-                entry['target_folder'] = target_folder_name
+            raw_text = sanitize_label(entry.get('clean_text') or entry.get('text'))
+            url = (entry.get('url') or '').strip()
+            if not raw_text or not url:
+                continue
 
-                class_to_entries[target_folder_name].append(entry)
-                total_entries += 1
+            if ONLY_DOWNLOAD_PRIORITY and raw_text not in priority_map:
+                continue
+
+            start_time = float(entry.get('start_time') or 0)
+            end_time = float(entry.get('end_time') or 0)
+            if end_time <= start_time:
+                continue
+
+            # Prefer the split tag ingested in DB, fallback to source JSON split
+            db_key = (
+                raw_text,
+                url,
+                round(start_time, 3),
+                round(end_time, 3)
+            )
+            entry['split'] = db_tags.get(db_key, file_split)
+
+            target_folder_name = existing_folders.get(raw_text, raw_text)
+            entry['target_folder'] = target_folder_name
+
+            class_to_entries[target_folder_name].append(entry)
+            total_entries += 1
 
     print(f"Total video metadata entries parsed across JSON splits: {total_entries}")
 
@@ -284,7 +332,7 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         else:
             discarded_classes += 1
 
-    priority_matches = sum(1 for k in valid_dataset if k.lower().replace(" ", "_") in priority_map)
+    priority_matches = sum(1 for k in valid_dataset if sanitize_label(k) in priority_map)
     print(f"\n--- Pre-Download Filtering ---")
     print(f"Classes meeting >= {min_samples} total possible video requirement: {len(valid_dataset)} ({priority_matches} priority signs matched)")
     print(f"Classes discarded: {discarded_classes}")
@@ -294,8 +342,13 @@ def load_and_filter_metadata(priority_map, min_samples=3):
 
 def download_clip(url, start_time, end_time, output_path):
     """Streams and trims YouTube clip with yt-dlp + ffmpeg."""
+    if not url or float(end_time) <= float(start_time):
+        return False
+
     if os.path.exists(output_path):
-        return True
+        if os.path.getsize(output_path) > 0:
+            return True
+        os.remove(output_path)
 
     cmd = [
         "yt-dlp",
@@ -310,13 +363,29 @@ def download_clip(url, start_time, end_time, output_path):
 
     try:
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        return result.returncode == 0 and os.path.exists(output_path)
+        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True
     except Exception:
-        return False
+        pass
+
+    # Clean up empty or partial file if download failed
+    if os.path.exists(output_path):
+        try:
+            os.remove(output_path)
+        except OSError:
+            pass
+
+    return False
 
 
 def fetch_msasl_dataset():
     """Main execution loop: reads priority_signs.txt, downloads priority classes first, then general classes."""
+    if not shutil.which("yt-dlp") or not shutil.which("ffmpeg"):
+        raise RuntimeError(
+            "Both 'yt-dlp' and 'ffmpeg' must be installed and available on your PATH "
+            "before downloading MS-ASL clips."
+        )
+
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
     priority_map = load_priority_map(PRIORITY_FILE_PATH)
     print(f"Loaded {len(priority_map)} priority signs from {os.path.basename(PRIORITY_FILE_PATH)}.")
@@ -330,12 +399,11 @@ def fetch_msasl_dataset():
     manifest = load_download_manifest()
     fallback_rank = len(priority_map)
 
-    # Identify classes that still have pending downloads
     classes_with_pending = []
     for folder_name, entries in valid_dataset.items():
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(label_dir)
-        norm_name = folder_name.lower().replace(" ", "_")
+        norm_name = sanitize_label(folder_name)
         is_priority = norm_name in priority_map
 
         pending = []
@@ -357,10 +425,6 @@ def fetch_msasl_dataset():
         print("\nAll eligible sign classes are already fully downloaded!")
         return
 
-    # Sort order:
-    # 1. Priority signs strictly before general signs
-    # 2. Classes with < MIN_VIDEOS_PER_CLASS existing clips first
-    # 3. Exact line order in priority_signs.txt (alphabetical fallback for general signs)
     classes_with_pending.sort(
         key=lambda x: (
             not x['is_priority'],
@@ -381,7 +445,8 @@ def fetch_msasl_dataset():
         folder_name = item['folder_name']
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
         os.makedirs(label_dir, exist_ok=True)
-        manifest.setdefault(folder_name, {})
+        if not isinstance(manifest.get(folder_name), dict):
+            manifest[folder_name] = {}
 
         next_num = get_next_video_number(label_dir, folder_name)
         tier_tag = "[PRIORITY]" if item['is_priority'] else "[GENERAL]"
@@ -390,12 +455,11 @@ def fetch_msasl_dataset():
 
         success_count = 0
         for entry, clip_key in item['pending']:
-            url = entry['url']
-            start_time = entry.get('start_time', 0)
-            end_time = entry.get('end_time', 0)
-            tag = entry.get('split', 'train')
+            url = (entry.get('url') or '').strip()
+            start_time = float(entry.get('start_time') or 0)
+            end_time = float(entry.get('end_time') or 0)
+            tag = (entry.get('split') or 'train').strip().lower()
 
-            # Format: <sign>_<number>_<tag>.mp4 (e.g., hello_1_train.mp4)
             file_name = f"{folder_name}_{next_num}_{tag}.mp4"
             output_path = os.path.join(label_dir, file_name)
 
