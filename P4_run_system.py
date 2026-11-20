@@ -1,11 +1,10 @@
 import os
 import sqlite3
+from collections import deque, Counter
 import cv2
 import numpy as np
-import tensorflow as tf
 from keras.models import load_model
 import mediapipe as mp
-from collections import deque, Counter
 
 # ==============================================================================
 # PATHS & SYSTEM CONFIGURATION
@@ -14,31 +13,73 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
 
-SEQUENCE_LENGTH = 30 
+SEQUENCE_LENGTH = 30
+EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
+
 
 # ==============================================================================
 # HELPER FUNCTIONS: DATABASE & DATA PROCESSING
 # ==============================================================================
 def load_db_cache():
+    """
+    Loads trained class labels (sorted alphabetically to match LabelEncoder),
+    display name mappings, and facial expression thresholds from SQLite.
+    """
+    trained_labels = []
     gesture_cache = {}
     expression_thresholds = {}
 
-    if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
+    if not os.path.exists(DB_PATH):
+        return trained_labels, gesture_cache, expression_thresholds
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
         cursor = conn.cursor()
 
-        cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings;")
-        for raw_label, display_name, min_score in cursor.fetchall():
-            gesture_cache[raw_label] = {'display_name': display_name, 'min_score': min_score}
+        # 1. Load trained class order matching sklearn LabelEncoder().fit()
+        try:
+            cursor.execute(
+                "SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC;"
+            )
+            trained_labels = [row[0] for row in cursor.fetchall()]
+        except sqlite3.OperationalError:
+            pass
 
-        cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds;")
-        for blendshape, display_name, threshold in cursor.fetchall():
-            expression_thresholds[blendshape] = {'display_name': display_name, 'threshold': threshold}
+        # 2. Load display names and confidence thresholds
+        try:
+            cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings;")
+            for raw_label, display_name, min_score in cursor.fetchall():
+                if not raw_label:
+                    continue
+                gesture_cache[raw_label] = {
+                    'display_name': display_name or raw_label.replace('_', ' ').title(),
+                    'min_score': float(min_score) if min_score is not None else 0.40
+                }
+        except sqlite3.OperationalError:
+            pass
+
+        # 3. Load facial expression activation thresholds
+        try:
+            cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds;")
+            for blendshape, display_name, threshold in cursor.fetchall():
+                if not blendshape or threshold is None:
+                    continue
+                expression_thresholds[blendshape] = {
+                    'display_name': display_name or blendshape,
+                    'threshold': float(threshold)
+                }
+        except sqlite3.OperationalError:
+            pass
+    finally:
         conn.close()
 
-    return gesture_cache, expression_thresholds
+    # Fallback if training_dataset was cleared while gesture_mappings still exists
+    if not trained_labels and gesture_cache:
+        trained_labels = sorted(gesture_cache.keys())
+
+    return trained_labels, gesture_cache, expression_thresholds
 
 
 def get_confidence_color(score):
@@ -51,18 +92,18 @@ def get_confidence_color(score):
 
 def extract_landmarks(results):
     """
-    Flattens spatial (X, Y, Z) coordinates from MediaPipe Holistic output 
-    into a single 1D feature vector of exactly 225 values.
+    Flattens spatial (X, Y, Z) coordinates from MediaPipe Holistic output
+    into a single 1D float32 feature vector of exactly 225 values.
     """
-    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten() \
-        if results.pose_landmarks else np.zeros(33 * 3)
-    
-    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() \
-        if results.left_hand_landmarks else np.zeros(21 * 3)
-    
-    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() \
-        if results.right_hand_landmarks else np.zeros(21 * 3)
-    
+    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
+
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
     # 99 + 63 + 63 = 225
     return np.concatenate([pose, lh, rh])
 
@@ -164,119 +205,135 @@ def detect_expressions(results, thresholds):
 
     return active_emotions
 
+
 # ==============================================================================
 # GUI SCREENS & STATE MANAGERS
 # ==============================================================================
 def show_main_menu():
+    window_name = 'SAIgn - Main Menu'
     menu_bg = np.zeros((600, 800, 3), dtype=np.uint8)
-    
-    cv2.rectangle(menu_bg, (50, 50), (750, 550), (35, 35, 35), -1)
-    cv2.rectangle(menu_bg, (50, 50), (750, 550), (0, 215, 255), 2) 
 
-    cv2.putText(menu_bg, "SAIgn Vision Engine", (160, 150), 
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (35, 35, 35), -1)
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (0, 215, 255), 2)
+
+    cv2.putText(menu_bg, "SAIgn Vision Engine", (160, 150),
                 cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
-    cv2.putText(menu_bg, "Automated ASL & Expression HUD", (230, 200), 
+    cv2.putText(menu_bg, "Automated ASL & Expression HUD", (230, 200),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 1, cv2.LINE_AA)
 
     cv2.rectangle(menu_bg, (150, 280), (650, 350), (50, 50, 50), -1)
-    cv2.putText(menu_bg, "[ SPACE / ENTER ] Start Recognition", (170, 325), 
+    cv2.putText(menu_bg, "[ SPACE / ENTER ] Start Recognition", (170, 325),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 127), 2, cv2.LINE_AA)
 
     cv2.rectangle(menu_bg, (150, 380), (650, 450), (50, 50, 50), -1)
-    cv2.putText(menu_bg, "[ ESC ] Shut Down Engine", (240, 425), 
+    cv2.putText(menu_bg, "[ ESC ] Shut Down Engine", (240, 425),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 127, 255), 2, cv2.LINE_AA)
 
-    cv2.imshow('SAIgn - Main Menu', menu_bg)
+    cv2.imshow(window_name, menu_bg)
 
     while True:
         key = cv2.waitKey(30) & 0xFF
-        if key == 27:  
+        # Treat manual window 'X' close button the same as ESC
+        if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             cv2.destroyAllWindows()
+            cv2.waitKey(1)
             return 'QUIT'
-        elif key in (13, 32):  
-            cv2.destroyWindow('SAIgn - Main Menu')
+        elif key in (13, 32):
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
             return 'START'
 
 
-def run_recognition_engine(model, gesture_cache, expression_thresholds):
-    labels = list(gesture_cache.keys()) if gesture_cache else ['UNKNOWN']
-    
+def run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, sequence_length):
+    window_name = 'SAIgn - Live Recognition Engine'
+    labels = trained_labels if trained_labels else ['UNKNOWN']
+
     mp_holistic = mp.solutions.holistic
     mp_drawing = mp.solutions.drawing_utils
-    cap = cv2.VideoCapture(0)
 
-    sequence_buffer = []  
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError(
+            "Could not open webcam (camera index 0). "
+            "Verify that no other app is using the camera and macOS Camera permissions are granted."
+        )
+
+    sequence_buffer = deque(maxlen=sequence_length)
     prediction_history = deque(maxlen=DEBOUNCE_WINDOW_SIZE)
-    
+
     current_gesture = "Waiting..."
     confidence = 0.0
 
-    with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret:
-                break
+    try:
+        with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("[WARN] Failed to read frame from webcam. Ending capture session.")
+                    break
 
-            image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            image.flags.writeable = False  
-            results = holistic.process(image)
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = holistic.process(image)
 
-            image.flags.writeable = True
-            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+                image.flags.writeable = True
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-            mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-            mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
-            mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
+                mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
 
-            keypoints = extract_landmarks(results)
-            sequence_buffer.append(keypoints)
-            sequence_buffer = sequence_buffer[-SEQUENCE_LENGTH:]  
+                keypoints = extract_landmarks(results)
+                sequence_buffer.append(keypoints)
 
-            if len(sequence_buffer) == SEQUENCE_LENGTH:
-                res = model.predict(np.expand_dims(sequence_buffer, axis=0), verbose=0)[0]
-                prediction_idx = np.argmax(res)
-                confidence = float(res[prediction_idx])
+                if len(sequence_buffer) == sequence_length:
+                    input_tensor = np.expand_dims(np.array(sequence_buffer, dtype=np.float32), axis=0)
+                    res = model.predict(input_tensor, verbose=0)[0]
+                    prediction_idx = int(np.argmax(res))
+                    confidence = float(res[prediction_idx])
 
-                raw_label = labels[prediction_idx] if prediction_idx < len(labels) else "UNKNOWN"
-                
-                cached_data = gesture_cache.get(raw_label, {
-                    'display_name': raw_label.replace('_', ' ').title(),
-                    'min_score': 0.40
-                })
+                    raw_label = labels[prediction_idx] if prediction_idx < len(labels) else "UNKNOWN"
 
-                if confidence >= cached_data['min_score']:
-                    frame_candidate = cached_data['display_name']
-                else:
-                    frame_candidate = "Uncertain"
+                    cached_data = gesture_cache.get(raw_label, {
+                        'display_name': raw_label.replace('_', ' ').title(),
+                        'min_score': 0.40
+                    })
 
-                prediction_history.append(frame_candidate)
+                    if confidence >= cached_data['min_score']:
+                        frame_candidate = cached_data['display_name']
+                    else:
+                        frame_candidate = "Uncertain"
 
-                vote_counts = Counter(prediction_history)
-                most_common_gesture, vote_count = vote_counts.most_common(1)[0]
+                    prediction_history.append(frame_candidate)
 
-                if vote_count >= DEBOUNCE_CONSENSUS_COUNT:
-                    current_gesture = most_common_gesture
+                    vote_counts = Counter(prediction_history)
+                    most_common_gesture, vote_count = vote_counts.most_common(1)[0]
 
-            active_expressions = detect_expressions(results, expression_thresholds)
-            emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
+                    if vote_count >= DEBOUNCE_CONSENSUS_COUNT:
+                        current_gesture = most_common_gesture
 
-            hud_color = get_confidence_color(confidence)
+                active_expressions = detect_expressions(results, expression_thresholds)
+                emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
 
-            cv2.rectangle(image, (10, 10), (480, 110), (30, 30, 30), -1)
-            cv2.rectangle(image, (10, 10), (480, 110), hud_color, 2)
+                hud_color = get_confidence_color(confidence)
 
-            cv2.putText(image, f"Sign: {current_gesture} ({confidence*100:.1f}%)", 
-                        (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, hud_color, 2, cv2.LINE_AA)
-            cv2.putText(image, emotion_text, 
-                        (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+                cv2.rectangle(image, (10, 10), (480, 110), (30, 30, 30), -1)
+                cv2.rectangle(image, (10, 10), (480, 110), hud_color, 2)
 
-            cv2.imshow('SAIgn - Live Recognition Engine', image)
+                cv2.putText(image, f"Sign: {current_gesture} ({confidence*100:.1f}%)",
+                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, hud_color, 2, cv2.LINE_AA)
+                cv2.putText(image, emotion_text,
+                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
 
-            if cv2.waitKey(10) & 0xFF == 27:
-                break
+                cv2.imshow(window_name, image)
 
-    cap.release()
-    cv2.destroyWindow('SAIgn - Live Recognition Engine')
+                key = cv2.waitKey(10) & 0xFF
+                if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
 
 
 # ==============================================================================
@@ -291,15 +348,36 @@ def main():
 
     model = load_model(MODEL_PATH)
 
+    # Validate model input dimensions up front to prevent mid-stream crashes
+    input_shape = model.input_shape
+    if isinstance(input_shape, list):
+        input_shape = input_shape[0]
+
+    seq_len = input_shape[1] or SEQUENCE_LENGTH
+    feature_dim = input_shape[2]
+    if feature_dim != EXPECTED_FEATURE_DIM:
+        raise ValueError(
+            f"Model feature dimension mismatch: '{MODEL_PATH}' expects {feature_dim} features per frame, "
+            f"but Holistic extraction produces {EXPECTED_FEATURE_DIM}. Re-extract features and retrain the model."
+        )
+
+    model_num_classes = model.output_shape[-1]
+
     while True:
-        gesture_cache, expression_thresholds = load_db_cache()
+        trained_labels, gesture_cache, expression_thresholds = load_db_cache()
+        if trained_labels and len(trained_labels) != model_num_classes:
+            print(
+                f"[WARN] Database has {len(trained_labels)} trained label(s), "
+                f"but model outputs {model_num_classes} class(es). Retrain the model if labels changed."
+            )
+
         action = show_main_menu()
 
         if action == 'QUIT':
             print("Exiting SAIgn Engine cleanly. Goodbye!")
             break
         elif action == 'START':
-            run_recognition_engine(model, gesture_cache, expression_thresholds)
+            run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, seq_len)
 
 
 if __name__ == "__main__":
