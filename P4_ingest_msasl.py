@@ -14,42 +14,73 @@ json_files = {
 }
 
 
+def normalize_box(raw_box):
+    """Safely extracts 4 bounding-box coordinates even if 'box' is null or malformed."""
+    if isinstance(raw_box, (list, tuple)):
+        padded = list(raw_box[:4]) + [None] * max(0, 4 - len(raw_box))
+        return padded[0], padded[1], padded[2], padded[3]
+    return None, None, None, None
+
+
 def ingest_data():
     """Reads JSON files and populates the SQLite database table."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    # Create target table if it doesn't exist
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS video_clips (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            clean_text TEXT,
-            label INTEGER,
-            signer_id INTEGER,
-            signer INTEGER,
-            start_time REAL,
-            end_time REAL,
-            start_frame INTEGER,
-            end_frame INTEGER,
-            url TEXT,
-            file_title TEXT,
-            split TEXT,
-            box_ymin REAL,
-            box_xmin REAL,
-            box_ymax REAL,
-            box_xmax REAL
-        )
-    ''')
+        # Create target table if it doesn't exist
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS video_clips (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                clean_text TEXT,
+                label INTEGER,
+                signer_id INTEGER,
+                signer INTEGER,
+                start_time REAL,
+                end_time REAL,
+                start_frame INTEGER,
+                end_frame INTEGER,
+                url TEXT,
+                file_title TEXT,
+                split TEXT,
+                box_ymin REAL,
+                box_xmin REAL,
+                box_ymax REAL,
+                box_xmax REAL
+            )
+        ''')
 
-    # Ingest records split by split
-    for split_name, file_path in json_files.items():
+        # Prevent duplicate clip rows if the ingestion script is executed multiple times
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
+            cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_video_clips_unique
+                ON video_clips (clean_text, url, start_time, end_time, split)
+            ''')
+        except sqlite3.OperationalError:
+            pass
+
+        # Ingest records split by split
+        for split_name, file_path in json_files.items():
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+            except FileNotFoundError:
+                print(f"Warning: {file_path} not found. Skipping.")
+                continue
+            except (json.JSONDecodeError, OSError) as e:
+                print(f"Warning: Failed to read {file_path} ({e}). Skipping.")
+                continue
+
+            if not isinstance(data, list):
+                print(f"Warning: Expected a JSON list in {file_path}. Skipping.")
+                continue
 
             records_to_insert = []
             for entry in data:
-                box = entry.get('box', [None, None, None, None])
+                if not isinstance(entry, dict):
+                    continue
+
+                b_ymin, b_xmin, b_ymax, b_xmax = normalize_box(entry.get('box'))
                 records_to_insert.append((
                     entry.get('clean_text'),
                     entry.get('label'),
@@ -62,45 +93,46 @@ def ingest_data():
                     entry.get('url'),
                     entry.get('file'),
                     split_name,  # Tag split based on source file
-                    box[0], box[1], box[2], box[3]
+                    b_ymin, b_xmin, b_ymax, b_xmax
                 ))
 
             cursor.executemany('''
-                INSERT INTO video_clips (
-                    clean_text, label, signer_id, signer, start_time, end_time, 
-                    start_frame, end_frame, url, file_title, split, 
+                INSERT OR IGNORE INTO video_clips (
+                    clean_text, label, signer_id, signer, start_time, end_time,
+                    start_frame, end_frame, url, file_title, split,
                     box_ymin, box_xmin, box_ymax, box_xmax
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', records_to_insert)
 
-            print(f"Successfully inserted {len(records_to_insert)} items into split: {split_name}")
+            print(f"Processed {len(records_to_insert)} items for split: {split_name} (new rows inserted: {cursor.rowcount})")
 
-        except FileNotFoundError:
-            print(f"Warning: {file_path} not found. Skipping.")
-
-    conn.commit()
-    conn.close()
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def print_split_percentages():
     """Queries the database and displays the distribution of train/val/test splits."""
+    if not os.path.exists(DB_PATH):
+        print("Database file not found. Nothing to summarize.")
+        return
+
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-
-    query = '''
-        SELECT 
-            split, 
-            COUNT(*) AS clip_count,
-            ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM video_clips), 2) AS percentage
-        FROM video_clips
-        GROUP BY split;
-    '''
-
     try:
+        cursor = conn.cursor()
+        query = '''
+            SELECT
+                split,
+                COUNT(*) AS clip_count,
+                ROUND(COUNT(*) * 100.0 / NULLIF((SELECT COUNT(*) FROM video_clips), 0), 2) AS percentage
+            FROM video_clips
+            GROUP BY split;
+        '''
         results = cursor.execute(query).fetchall()
         print("\n--- Database Split Distribution ---")
         for split, count, pct in results:
-            print(f"Split: {split:<6} | Clips: {count:<6} | Share: {pct}%")
+            pct_display = f"{pct}%" if pct is not None else "0.0%"
+            print(f"Split: {split:<6} | Clips: {count:<6} | Share: {pct_display}")
     except sqlite3.OperationalError as e:
         print(f"Error reading database: {e}")
     finally:
