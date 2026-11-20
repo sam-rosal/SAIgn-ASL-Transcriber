@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import numpy as np
@@ -13,17 +14,30 @@ from sklearn.preprocessing import LabelEncoder
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
+CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 
 
 def load_all_labels():
-    """Fetches all unique labels across the entire dataset to ensure exact LabelEncoder mapping."""
+    """
+    Loads the exact class list saved during training (classes.json),
+    falling back to alphabetical unique labels in SQLite if classes.json is absent.
+    """
+    if os.path.exists(CLASSES_PATH):
+        try:
+            with open(CLASSES_PATH, 'r', encoding='utf-8') as f:
+                classes = json.load(f)
+                if isinstance(classes, list) and classes:
+                    return classes
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] Failed to read {CLASSES_PATH} ({e}). Falling back to SQLite...")
+
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Database not found at {DB_PATH}. Run P4_setup_db_3.py and P4_extract_features_3.py first.")
+        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_3.py first.")
 
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.cursor()
-        data = cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL").fetchall()
+        data = cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC").fetchall()
         return [row[0] for row in data]
     except sqlite3.OperationalError as e:
         raise RuntimeError(f"Database table 'training_dataset' is missing or unreadable: {e}") from e
@@ -33,6 +47,9 @@ def load_all_labels():
 
 def load_benchmark_data(split_name):
     """Queries the specific dataset split for benchmarking."""
+    if not os.path.exists(DB_PATH):
+        raise FileNotFoundError(f"Database not found at {DB_PATH}.")
+
     conn = sqlite3.connect(DB_PATH)
     try:
         cursor = conn.cursor()
@@ -44,12 +61,18 @@ def load_benchmark_data(split_name):
         conn.close()
 
 
-def prepare_tensors(data_list, expected_shape):
+def prepare_tensors(data_list, expected_shape, known_classes):
     """Loads .npy feature matrices and string labels into uniform NumPy arrays."""
     X, y = [], []
     skipped = 0
+    known_set = set(known_classes)
 
     for npy_path, label in data_list:
+        if label not in known_set:
+            print(f"[WARN] Label '{label}' is not in trained classes.json. Skipping...")
+            skipped += 1
+            continue
+
         if not npy_path or not os.path.exists(npy_path):
             skipped += 1
             continue
@@ -70,7 +93,7 @@ def prepare_tensors(data_list, expected_shape):
         y.append(label)
 
     if skipped > 0:
-        print(f"[WARN] Skipped {skipped} missing, corrupted, or shape-mismatched feature file(s).")
+        print(f"[WARN] Skipped {skipped} missing, unknown-label, or shape-mismatched feature file(s).")
 
     if not X:
         return np.empty((0, *expected_shape), dtype=np.float32), np.array([], dtype=str)
@@ -79,7 +102,6 @@ def prepare_tensors(data_list, expected_shape):
 
 
 def run_benchmark():
-    # 1. Mode Selection Menu
     print("==================================================")
     print("             SAIgn BENCHMARK UTILITY              ")
     print("==================================================")
@@ -111,20 +133,18 @@ def run_benchmark():
 
     cm_output_path = os.path.join(SCRIPT_DIR, output_filename)
 
-    # 2. Verification & Model Load
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model.py first.")
+        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_3.py first.")
 
     print("Loading AI model into memory...")
     model = load_model(MODEL_PATH)
-    expected_input_shape = tuple(model.input_shape[1:])  # e.g., (30, 225)
+    expected_input_shape = tuple(model.input_shape[1:])
     model_num_classes = model.output_shape[-1]
 
-    # 3. Reconstruct Label Encoder
-    print("Synchronizing class mappings from database...")
+    print("Synchronizing class mappings...")
     all_labels = load_all_labels()
     if not all_labels:
-        print("[ERROR] No labels found in 'training_dataset'. Run feature extraction and model training first.")
+        print("[ERROR] No class labels found. Run P4_train_model_3.py first.")
         return
 
     label_encoder = LabelEncoder()
@@ -135,29 +155,26 @@ def run_benchmark():
     if len(class_names) != model_num_classes:
         raise ValueError(
             f"Class count mismatch: model outputs {model_num_classes} classes, "
-            f"but database has {len(class_names)} classes. Retrain the model with P4_train_model.py."
+            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_3.py."
         )
 
-    # 4. Load Requested Data Split
     print(f"Loading '{target_split}' dataset...")
     benchmark_data = load_benchmark_data(target_split)
     if not benchmark_data:
         print(f"[ERROR] No '{target_split}' data found in saign_vision.db. Cannot run benchmark.")
         return
 
-    X_test, y_test_str = prepare_tensors(benchmark_data, expected_input_shape)
+    X_test, y_test_str = prepare_tensors(benchmark_data, expected_input_shape, class_names)
     if len(X_test) == 0:
         print(f"[ERROR] Zero valid '{target_split}' feature arrays available on disk matching shape {expected_input_shape}.")
         return
 
     y_true = label_encoder.transform(y_test_str)
 
-    # 5. Run Model Predictions
     print(f"Running predictions on {len(X_test)} samples...")
     y_pred_probs = model.predict(X_test, verbose=0)
     y_pred = np.argmax(y_pred_probs, axis=1)
 
-    # 6. Output Classification Report
     print("\n" + "=" * 60)
     print(f"CLASSIFICATION REPORT: {target_split.upper()} SPLIT")
     print("=" * 60)
@@ -169,7 +186,6 @@ def run_benchmark():
         zero_division=0
     ))
 
-    # 7. Generate and Save Confusion Matrix
     print("\nGenerating visual Confusion Matrix...")
     cm = confusion_matrix(y_true, y_pred, labels=class_indices)
 
