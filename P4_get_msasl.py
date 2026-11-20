@@ -69,6 +69,16 @@ def sanitize_label(text):
     return re.sub(r'[\\/:*?"<>|]+', '_', cleaned)
 
 
+def parse_timestamp(value, default=0.0):
+    """Safely converts a metadata timestamp to float."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def write_default_priority_file(file_path):
     """Formats DEFAULT_PRIORITY_VOCAB into a clean, commented priority_signs.txt file."""
     lines = [
@@ -121,14 +131,12 @@ def get_youtube_id(url):
 def get_clip_key(entry, idx):
     """Generates a unique identifier for a metadata entry to avoid duplicate downloads."""
     url = entry.get('url') or ''
-    start_time = float(entry.get('start_time') or 0)
-    end_time = float(entry.get('end_time') or 0)
+    start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
+    end_time = parse_timestamp(entry.get('end_time'), 0.0) or 0.0
 
     yt_id = get_youtube_id(url)
     if yt_id:
-        start_sec = int(start_time)
-        end_sec = int(end_time)
-        return f"{yt_id}_{start_sec}_{end_sec}"
+        return f"{yt_id}_{int(start_time)}_{int(end_time)}"
     split_tag = entry.get('split') or 'train'
     return f"msasl_{idx}_{split_tag}"
 
@@ -155,7 +163,7 @@ def save_download_manifest(manifest):
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_3.py).
+    saign_vision.db (populated by P4_ingest_msasl_4.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -172,12 +180,11 @@ def load_db_split_tags():
         """)
         for clean_text, url, start_time, end_time, split in cursor.fetchall():
             norm_text = sanitize_label(clean_text)
-            key = (
-                norm_text,
-                url or '',
-                round(float(start_time or 0), 3),
-                round(float(end_time or 0), 3)
-            )
+            st = parse_timestamp(start_time, 0.0)
+            et = parse_timestamp(end_time, 0.0)
+            if st is None or et is None:
+                continue
+            key = (norm_text, url or '', round(st, 3), round(et, 3))
             tag_lookup[key] = (split or 'train').strip().lower()
     except sqlite3.Error:
         pass
@@ -301,9 +308,9 @@ def load_and_filter_metadata(priority_map, min_samples=3):
             if ONLY_DOWNLOAD_PRIORITY and raw_text not in priority_map:
                 continue
 
-            start_time = float(entry.get('start_time') or 0)
-            end_time = float(entry.get('end_time') or 0)
-            if end_time <= start_time:
+            start_time = parse_timestamp(entry.get('start_time'), 0.0)
+            end_time = parse_timestamp(entry.get('end_time'), 0.0)
+            if start_time is None or end_time is None or end_time <= start_time:
                 continue
 
             db_key = (
@@ -378,11 +385,12 @@ def download_clip(url, start_time, end_time, output_path):
     except Exception:
         pass
 
-    if os.path.exists(output_path):
-        try:
-            os.remove(output_path)
-        except OSError:
-            pass
+    for temp_path in (output_path, f"{output_path}.part"):
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
     return False
 
@@ -466,8 +474,8 @@ def fetch_msasl_dataset():
         failed_count = 0
         for entry, clip_key in item['pending']:
             url = (entry.get('url') or '').strip()
-            start_time = float(entry.get('start_time') or 0)
-            end_time = float(entry.get('end_time') or 0)
+            start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
+            end_time = parse_timestamp(entry.get('end_time'), 0.0) or 0.0
             tag = (entry.get('split') or 'train').strip().lower()
 
             file_name = f"{folder_name}_{next_num}_{tag}.mp4"

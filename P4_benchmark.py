@@ -6,7 +6,6 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from keras.models import load_model
 from sklearn.metrics import classification_report, confusion_matrix
-from sklearn.preprocessing import LabelEncoder
 
 # ==============================================================================
 # SYSTEM & PATH CONFIGURATIONS
@@ -27,12 +26,12 @@ def load_all_labels():
             with open(CLASSES_PATH, 'r', encoding='utf-8') as f:
                 classes = json.load(f)
                 if isinstance(classes, list) and classes:
-                    return classes
+                    return [str(c) for c in classes]
         except (json.JSONDecodeError, OSError) as e:
             print(f"[WARN] Failed to read {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_3.py first.")
+        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_4.py first.")
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -61,14 +60,13 @@ def load_benchmark_data(split_name):
         conn.close()
 
 
-def prepare_tensors(data_list, expected_shape, known_classes):
-    """Loads .npy feature matrices and string labels into uniform NumPy arrays."""
+def prepare_tensors(data_list, expected_shape, class_to_idx):
+    """Loads .npy feature matrices and integer class indices into uniform NumPy arrays."""
     X, y = [], []
     skipped = 0
-    known_set = set(known_classes)
 
     for npy_path, label in data_list:
-        if label not in known_set:
+        if label not in class_to_idx:
             print(f"[WARN] Label '{label}' is not in trained classes.json. Skipping...")
             skipped += 1
             continue
@@ -89,16 +87,17 @@ def prepare_tensors(data_list, expected_shape, known_classes):
             skipped += 1
             continue
 
+        features = np.nan_to_num(features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         X.append(features)
-        y.append(label)
+        y.append(class_to_idx[label])
 
     if skipped > 0:
         print(f"[WARN] Skipped {skipped} missing, unknown-label, or shape-mismatched feature file(s).")
 
     if not X:
-        return np.empty((0, *expected_shape), dtype=np.float32), np.array([], dtype=str)
+        return np.empty((0, *expected_shape), dtype=np.float32), np.array([], dtype=np.int64)
 
-    return np.array(X, dtype=np.float32), np.array(y)
+    return np.array(X, dtype=np.float32), np.array(y, dtype=np.int64)
 
 
 def run_benchmark():
@@ -134,28 +133,27 @@ def run_benchmark():
     cm_output_path = os.path.join(SCRIPT_DIR, output_filename)
 
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_3.py first.")
+        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_4.py first.")
 
     print("Loading AI model into memory...")
     model = load_model(MODEL_PATH)
-    expected_input_shape = tuple(model.input_shape[1:])
+    input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
+    expected_input_shape = tuple(input_shape[1:])
     model_num_classes = model.output_shape[-1]
 
     print("Synchronizing class mappings...")
-    all_labels = load_all_labels()
-    if not all_labels:
-        print("[ERROR] No class labels found. Run P4_train_model_3.py first.")
+    class_names = load_all_labels()
+    if not class_names:
+        print("[ERROR] No class labels found. Run P4_train_model_4.py first.")
         return
 
-    label_encoder = LabelEncoder()
-    label_encoder.fit(all_labels)
-    class_names = label_encoder.classes_
+    class_to_idx = {name: idx for idx, name in enumerate(class_names)}
     class_indices = np.arange(len(class_names))
 
     if len(class_names) != model_num_classes:
         raise ValueError(
             f"Class count mismatch: model outputs {model_num_classes} classes, "
-            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_3.py."
+            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_4.py."
         )
 
     print(f"Loading '{target_split}' dataset...")
@@ -164,12 +162,10 @@ def run_benchmark():
         print(f"[ERROR] No '{target_split}' data found in saign_vision.db. Cannot run benchmark.")
         return
 
-    X_test, y_test_str = prepare_tensors(benchmark_data, expected_input_shape, class_names)
+    X_test, y_true = prepare_tensors(benchmark_data, expected_input_shape, class_to_idx)
     if len(X_test) == 0:
         print(f"[ERROR] Zero valid '{target_split}' feature arrays available on disk matching shape {expected_input_shape}.")
         return
-
-    y_true = label_encoder.transform(y_test_str)
 
     print(f"Running predictions on {len(X_test)} samples...")
     y_pred_probs = model.predict(X_test, verbose=0)
@@ -207,8 +203,13 @@ def run_benchmark():
 
     plt.savefig(cm_output_path, dpi=300)
     print(f"Confusion matrix heat map saved successfully to: {cm_output_path}")
-    plt.show()
-    plt.close()
+
+    try:
+        plt.show()
+    except Exception as e:
+        print(f"[WARN] Could not open interactive display window ({e}). Saved chart is at {cm_output_path}.")
+    finally:
+        plt.close()
 
 
 if __name__ == "__main__":

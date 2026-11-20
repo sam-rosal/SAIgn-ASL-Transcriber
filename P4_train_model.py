@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import cv2
@@ -18,6 +19,7 @@ DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
 FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
+CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 
 TARGET_FRAMES = 30
 FEATURE_DIM = 225  # Pose (33*3=99) + Left Hand (21*3=63) + Right Hand (21*3=63)
@@ -98,7 +100,7 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
 
 
 def ensure_tables_exist(cursor):
-    """Ensures training_dataset exists even if setup_db was not executed first."""
+    """Ensures training_dataset and its required columns exist even on legacy databases."""
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS training_dataset (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +112,20 @@ def ensure_tables_exist(cursor):
         npy_path TEXT,
         split TEXT NOT NULL DEFAULT 'train'
     );""")
+
+    existing_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
+    }
+    required_columns = {
+        'clip_id': "INTEGER",
+        'extracted_features_path': "TEXT",
+        'npy_path': "TEXT",
+        'split': "TEXT NOT NULL DEFAULT 'train'"
+    }
+    for col_name, col_def in required_columns.items():
+        if col_name not in existing_cols:
+            cursor.execute(f"ALTER TABLE training_dataset ADD COLUMN {col_name} {col_def};")
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);")
 
 
@@ -121,11 +137,18 @@ def resolve_split_tag(cursor, video_file):
 
     yt_id = stem_parts[0]
     try:
-        cursor.execute("""
-            SELECT split FROM video_clips
-            WHERE file_title = ? OR url LIKE ?
-            LIMIT 1
-        """, (video_file, f"%{yt_id}%"))
+        if len(yt_id) == 11:
+            cursor.execute("""
+                SELECT split FROM video_clips
+                WHERE file_title = ? OR url LIKE ?
+                LIMIT 1
+            """, (video_file, f"%{yt_id}%"))
+        else:
+            cursor.execute("""
+                SELECT split FROM video_clips
+                WHERE file_title = ?
+                LIMIT 1
+            """, (video_file,))
         result = cursor.fetchone()
         if result and result[0]:
             return result[0].strip().lower()
@@ -159,6 +182,7 @@ def register_and_process_dataset():
     try:
         cursor = conn.cursor()
         ensure_tables_exist(cursor)
+        conn.commit()
 
         with mp_holistic.Holistic(
             static_image_mode=False,
@@ -190,6 +214,7 @@ def register_and_process_dataset():
                             (video_path, label, num_frames, extracted_features_path, npy_path, split)
                             VALUES (?, ?, ?, ?, ?, ?);
                         """, (video_path, label_dir, TARGET_FRAMES, output_feature_path, output_feature_path, split_tag))
+                        conn.commit()
                         continue
 
                     holistic_extractor.reset()
@@ -207,8 +232,7 @@ def register_and_process_dataset():
                         (video_path, label, num_frames, extracted_features_path, npy_path, split)
                         VALUES (?, ?, ?, ?, ?, ?);
                     """, (video_path, label_dir, len(fixed_features), output_feature_path, output_feature_path, split_tag))
-
-        conn.commit()
+                    conn.commit()
     finally:
         conn.close()
 
@@ -359,6 +383,10 @@ if __name__ == "__main__":
         batch_size=32
     )
 
-    # Step 8: Save Model
+    # Step 8: Save Model & Frozen Class Index Mapping
     model.save(MODEL_PATH)
+    with open(CLASSES_PATH, 'w', encoding='utf-8') as f:
+        json.dump(label_encoder.classes_.tolist(), f, indent=2)
+
     print(f"\nModel successfully saved to {MODEL_PATH}")
+    print(f"Class label mapping ({num_classes} classes) saved to {CLASSES_PATH}")

@@ -16,7 +16,7 @@ def ensure_training_dataset_columns(cursor):
         row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
     }
     required_columns = {
-        'clip_id': "INTEGER REFERENCES video_clips(id) ON DELETE SET NULL",
+        'clip_id': "INTEGER",
         'extracted_features_path': "TEXT",
         'npy_path': "TEXT",
         'split': "TEXT NOT NULL DEFAULT 'train'"

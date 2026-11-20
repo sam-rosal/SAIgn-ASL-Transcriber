@@ -98,7 +98,7 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
 
 
 def ensure_tables_exist(cursor):
-    """Ensures training_dataset exists even if P4_setup_db_3.py was not run prior."""
+    """Ensures training_dataset and its required columns exist even on legacy databases."""
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS training_dataset (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +110,20 @@ def ensure_tables_exist(cursor):
         npy_path TEXT,
         split TEXT NOT NULL DEFAULT 'train'
     );""")
+
+    existing_cols = {
+        row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
+    }
+    required_columns = {
+        'clip_id': "INTEGER",
+        'extracted_features_path': "TEXT",
+        'npy_path': "TEXT",
+        'split': "TEXT NOT NULL DEFAULT 'train'"
+    }
+    for col_name, col_def in required_columns.items():
+        if col_name not in existing_cols:
+            cursor.execute(f"ALTER TABLE training_dataset ADD COLUMN {col_name} {col_def};")
+
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);")
 
 
@@ -121,11 +135,18 @@ def resolve_split_tag(cursor, video_file):
 
     yt_id = stem_parts[0]
     try:
-        cursor.execute("""
-            SELECT split FROM video_clips
-            WHERE file_title = ? OR url LIKE ?
-            LIMIT 1
-        """, (video_file, f"%{yt_id}%"))
+        if len(yt_id) == 11:
+            cursor.execute("""
+                SELECT split FROM video_clips
+                WHERE file_title = ? OR url LIKE ?
+                LIMIT 1
+            """, (video_file, f"%{yt_id}%"))
+        else:
+            cursor.execute("""
+                SELECT split FROM video_clips
+                WHERE file_title = ?
+                LIMIT 1
+            """, (video_file,))
         result = cursor.fetchone()
         if result and result[0]:
             return result[0].strip().lower()

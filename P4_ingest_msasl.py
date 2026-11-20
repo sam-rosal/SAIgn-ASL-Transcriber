@@ -50,20 +50,32 @@ def ingest_data():
             )
         ''')
 
-        # COALESCE ensures NULL fields are still deduplicated properly in SQLite
-        try:
-            cursor.execute('''
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_video_clips_unique
-                ON video_clips (
+        # Clean up any pre-existing duplicates before enforcing the unique index
+        cursor.execute('''
+            DELETE FROM video_clips
+            WHERE id NOT IN (
+                SELECT MIN(id)
+                FROM video_clips
+                GROUP BY
                     COALESCE(clean_text, ''),
                     COALESCE(url, ''),
                     COALESCE(start_time, -1.0),
                     COALESCE(end_time, -1.0),
                     COALESCE(split, '')
-                )
-            ''')
-        except sqlite3.OperationalError:
-            pass
+            )
+        ''')
+
+        # COALESCE ensures NULL fields are still deduplicated properly in SQLite
+        cursor.execute('''
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_video_clips_unique
+            ON video_clips (
+                COALESCE(clean_text, ''),
+                COALESCE(url, ''),
+                COALESCE(start_time, -1.0),
+                COALESCE(end_time, -1.0),
+                COALESCE(split, '')
+            )
+        ''')
 
         for split_name, file_path in json_files.items():
             try:

@@ -1,364 +1,441 @@
 import json
 import os
 import sqlite3
+from collections import deque, Counter
 import cv2
-import mediapipe as mp
 import numpy as np
+from keras.models import load_model
+import mediapipe as mp
 from scipy.interpolate import interp1d
 
-# --- Model Training & Preprocessing Imports ---
-from keras.models import Model
-from keras.layers import Input, LSTM, Dense, Dropout, Attention, GlobalAveragePooling1D
-from keras.callbacks import EarlyStopping
-from keras.utils import to_categorical
-from sklearn.preprocessing import LabelEncoder
-
-# --- System & Path Configurations ---
+# ==============================================================================
+# PATHS & SYSTEM CONFIGURATION
+# ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
-DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
-FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
 CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 
-TARGET_FRAMES = 30
-FEATURE_DIM = 225  # Pose (33*3=99) + Left Hand (21*3=63) + Right Hand (21*3=63)
+SEQUENCE_LENGTH = 30
+RAW_CAPTURE_WINDOW = 45  # ~1.5s rolling capture buffer before velocity segmentation + resampling
 VELOCITY_THRESHOLD = 0.015
 MIN_ACTIVE_FRAMES = 10
-VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
+EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
+
+DEBOUNCE_WINDOW_SIZE = 8
+DEBOUNCE_CONSENSUS_COUNT = 5
 
 
-def extract_video_landmarks(video_path, holistic_extractor):
+# ==============================================================================
+# HELPER FUNCTIONS: DATABASE, LABELS & SIGNAL PROCESSING
+# ==============================================================================
+def load_trained_classes():
     """
-    Reads a video frame-by-frame, runs MediaPipe Holistic tracking, and converts
-    detected joint spatial coordinates into a structured NumPy matrix.
-
-    Output matrix shape: (total_frames, 225)
+    Loads the frozen class index array saved during training (classes.json),
+    falling back to alphabetical unique labels from SQLite if classes.json is missing.
     """
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        print(f"[WARN] Could not open video file: {video_path}. Skipping...")
-        return np.empty((0, FEATURE_DIM), dtype=np.float32)
+    if os.path.exists(CLASSES_PATH):
+        try:
+            with open(CLASSES_PATH, 'r', encoding='utf-8') as f:
+                classes = json.load(f)
+                if isinstance(classes, list) and classes:
+                    return [str(c) for c in classes]
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] Could not parse {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
-    video_features = []
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC;")
+            rows = cursor.fetchall()
+            if rows:
+                return [row[0] for row in rows]
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    return []
+
+
+def load_db_cache():
+    """
+    Loads display name mappings, confidence thresholds, and facial expression
+    thresholds from SQLite.
+    """
+    trained_labels = load_trained_classes()
+    gesture_cache = {}
+    expression_thresholds = {}
+
+    if not os.path.exists(DB_PATH):
+        return trained_labels, gesture_cache, expression_thresholds
+
+    conn = sqlite3.connect(DB_PATH)
     try:
-        while cap.isOpened():
-            ret, frame = cap.read()
-            if not ret or frame is None:
-                break
+        cursor = conn.cursor()
 
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic_extractor.process(rgb_frame)
+        try:
+            cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings;")
+            for raw_label, display_name, min_score in cursor.fetchall():
+                if not raw_label:
+                    continue
+                gesture_cache[raw_label] = {
+                    'display_name': display_name or raw_label.replace('_', ' ').title(),
+                    'min_score': float(min_score) if min_score is not None else 0.40
+                }
+        except sqlite3.OperationalError:
+            pass
 
-            pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
-
-            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
-
-            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
-
-            frame_coordinates = np.concatenate([pose, lh, rh])
-            video_features.append(frame_coordinates)
+        try:
+            cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds;")
+            for blendshape, display_name, threshold in cursor.fetchall():
+                if not blendshape or threshold is None:
+                    continue
+                expression_thresholds[blendshape] = {
+                    'display_name': display_name or blendshape,
+                    'threshold': float(threshold)
+                }
+        except sqlite3.OperationalError:
+            pass
     finally:
-        cap.release()
+        conn.close()
 
-    if not video_features:
-        return np.empty((0, FEATURE_DIM), dtype=np.float32)
+    if not trained_labels and gesture_cache:
+        trained_labels = sorted(gesture_cache.keys())
 
-    return np.nan_to_num(np.array(video_features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-
-
-def apply_velocity_segmentation(features, threshold=VELOCITY_THRESHOLD, min_frames=MIN_ACTIVE_FRAMES):
-    if len(features) < 2:
-        return features
-    frame_differences = features[1:] - features[:-1]
-    velocities = np.linalg.norm(frame_differences, axis=1)
-    active_mask = np.ones(len(features), dtype=bool)
-    active_mask[1:] = velocities >= threshold
-    filtered_features = features[active_mask]
-    if len(filtered_features) < min_frames:
-        return features
-    return filtered_features
+    return trained_labels, gesture_cache, expression_thresholds
 
 
-def resample_sequence(features, target_frames=TARGET_FRAMES):
+def get_confidence_color(score):
+    score = max(0.0, min(1.0, float(score)))
+    b = int((1.0 - score) * 255)
+    r = int(score * 255)
+    g = 0
+    return (b, g, r)
+
+
+def extract_landmarks(results):
+    """
+    Flattens spatial (X, Y, Z) coordinates from MediaPipe Holistic output
+    into a single 1D float32 feature vector of exactly 225 values.
+    """
+    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
+
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
+    return np.nan_to_num(np.concatenate([pose, lh, rh]), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
+    """
+    Mirrors P4_extract_features_4.py preprocessing on the live rolling window:
+    filters static transition frames via L2 velocity and resamples active motion
+    to target_frames (30), falling back to the latest 30 raw frames for static signs.
+    """
+    features = np.array(raw_buffer, dtype=np.float32)
+
+    if len(features) >= 2:
+        frame_differences = features[1:] - features[:-1]
+        velocities = np.linalg.norm(frame_differences, axis=1)
+        active_mask = np.ones(len(features), dtype=bool)
+        active_mask[1:] = velocities >= VELOCITY_THRESHOLD
+        filtered = features[active_mask]
+
+        if len(filtered) >= MIN_ACTIVE_FRAMES:
+            features = filtered
+        else:
+            features = features[-target_frames:]
+
     current_frames = len(features)
     if current_frames == target_frames:
-        return features.astype(np.float32)
+        return features
+
     if current_frames < 2:
         pad_amount = max(0, target_frames - current_frames)
-        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames].astype(np.float32)
+        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
+
     x_old = np.linspace(0, 1, num=current_frames)
     x_new = np.linspace(0, 1, num=target_frames)
     interpolator = interp1d(x_old, features, axis=0, kind='linear')
     return interpolator(x_new).astype(np.float32)
 
 
-def ensure_tables_exist(cursor):
-    """Ensures training_dataset exists even if setup_db was not executed first."""
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS training_dataset (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        clip_id INTEGER,
-        video_path TEXT UNIQUE,
-        label TEXT NOT NULL,
-        num_frames INTEGER,
-        extracted_features_path TEXT,
-        npy_path TEXT,
-        split TEXT NOT NULL DEFAULT 'train'
-    );""")
-    cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);")
+def detect_expressions(results, thresholds):
+    active_emotions = []
+    if not results.face_landmarks or not thresholds:
+        return active_emotions
+
+    landmarks = results.face_landmarks.landmark
+
+    # Brow furrow / squint (check stricter threshold 0.020 before 0.025)
+    if 'browLowerer' in thresholds or 'browSquint' in thresholds:
+        brow_dist = abs(landmarks[70].y - landmarks[159].y)
+        if 'browSquint' in thresholds and brow_dist < thresholds['browSquint']['threshold']:
+            active_emotions.append(thresholds['browSquint']['display_name'])
+        elif 'browLowerer' in thresholds and brow_dist < thresholds['browLowerer']['threshold']:
+            active_emotions.append(thresholds['browLowerer']['display_name'])
+
+    # Inner brow raise
+    if 'browInnerUp' in thresholds:
+        inner_brow = abs(landmarks[55].y - landmarks[6].y)
+        if inner_brow > thresholds['browInnerUp']['threshold']:
+            active_emotions.append(thresholds['browInnerUp']['display_name'])
+
+    # Eye aperture (shared between eyeWide and eyeSquint)
+    left_eye_open = abs(landmarks[159].y - landmarks[145].y)
+    right_eye_open = abs(landmarks[386].y - landmarks[374].y)
+
+    if 'eyeWideLeft' in thresholds or 'eyeWideRight' in thresholds:
+        left_wide = 'eyeWideLeft' in thresholds and left_eye_open > thresholds['eyeWideLeft']['threshold']
+        right_wide = 'eyeWideRight' in thresholds and right_eye_open > thresholds['eyeWideRight']['threshold']
+        if left_wide or right_wide:
+            display_label = thresholds.get('eyeWideLeft', thresholds.get('eyeWideRight', {})).get('display_name', 'Fearful / Startled')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    if 'eyeSquintLeft' in thresholds or 'eyeSquintRight' in thresholds:
+        left_squint = 'eyeSquintLeft' in thresholds and left_eye_open < thresholds['eyeSquintLeft']['threshold']
+        right_squint = 'eyeSquintRight' in thresholds and right_eye_open < thresholds['eyeSquintRight']['threshold']
+        if left_squint or right_squint:
+            display_label = thresholds.get('eyeSquintLeft', thresholds.get('eyeSquintRight', {})).get('display_name', 'Suspicious / Wincing')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # Smile
+    if 'mouthSmileLeft' in thresholds or 'mouthSmileRight' in thresholds:
+        left_smile = abs(landmarks[61].x - landmarks[13].x)
+        right_smile = abs(landmarks[291].x - landmarks[13].x)
+
+        left_active = 'mouthSmileLeft' in thresholds and left_smile > thresholds['mouthSmileLeft']['threshold']
+        right_active = 'mouthSmileRight' in thresholds and right_smile > thresholds['mouthSmileRight']['threshold']
+
+        if left_active or right_active:
+            display_label = thresholds.get('mouthSmileLeft', thresholds.get('mouthSmileRight', {})).get('display_name', 'Happy')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # Frown
+    if 'mouthFrownLeft' in thresholds or 'mouthFrownRight' in thresholds:
+        left_frown = landmarks[61].y - landmarks[17].y
+        right_frown = landmarks[291].y - landmarks[17].y
+
+        left_frown_active = 'mouthFrownLeft' in thresholds and left_frown > thresholds['mouthFrownLeft']['threshold']
+        right_frown_active = 'mouthFrownRight' in thresholds and right_frown > thresholds['mouthFrownRight']['threshold']
+
+        if left_frown_active or right_frown_active:
+            display_label = thresholds.get('mouthFrownLeft', thresholds.get('mouthFrownRight', {})).get('display_name', 'Sad / Concerned')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # Jaw drop / open mouth
+    if 'jawOpen' in thresholds:
+        mouth_open = abs(landmarks[14].y - landmarks[13].y)
+        if mouth_open > thresholds['jawOpen']['threshold']:
+            active_emotions.append(thresholds['jawOpen']['display_name'])
+
+    # Mouth pucker / horizontal narrowing
+    if 'mouthPucker' in thresholds:
+        mouth_width = abs(landmarks[291].x - landmarks[61].x)
+        if mouth_width < thresholds['mouthPucker']['threshold']:
+            active_emotions.append(thresholds['mouthPucker']['display_name'])
+
+    # Nose sneer
+    if 'noseSneerLeft' in thresholds or 'noseSneerRight' in thresholds:
+        nose_dist = abs(landmarks[197].y - landmarks[0].y)
+
+        left_sneer_active = 'noseSneerLeft' in thresholds and nose_dist < thresholds['noseSneerLeft']['threshold']
+        right_sneer_active = 'noseSneerRight' in thresholds and nose_dist < thresholds['noseSneerRight']['threshold']
+
+        if left_sneer_active or right_sneer_active:
+            display_label = thresholds.get('noseSneerLeft', thresholds.get('noseSneerRight', {})).get('display_name', 'Disgust')
+            if display_label not in active_emotions:
+                active_emotions.append(display_label)
+
+    # Neutral fallback
+    if not active_emotions and 'faceNeutral' in thresholds:
+        active_emotions.append(thresholds['faceNeutral']['display_name'])
+
+    return active_emotions
 
 
-def resolve_split_tag(cursor, video_file):
-    """Parses <tag> directly from <sign>_<number>_<tag>.mp4, with safe DB fallback for legacy names."""
-    stem_parts = os.path.splitext(video_file)[0].split('_')
-    if len(stem_parts) >= 3 and stem_parts[-1].lower() in ('train', 'val', 'test'):
-        return stem_parts[-1].lower()
+# ==============================================================================
+# GUI SCREENS & STATE MANAGERS
+# ==============================================================================
+def show_main_menu():
+    window_name = 'SAIgn - Main Menu'
+    menu_bg = np.zeros((600, 800, 3), dtype=np.uint8)
 
-    yt_id = stem_parts[0]
-    try:
-        cursor.execute("""
-            SELECT split FROM video_clips
-            WHERE file_title = ? OR url LIKE ?
-            LIMIT 1
-        """, (video_file, f"%{yt_id}%"))
-        result = cursor.fetchone()
-        if result and result[0]:
-            return result[0].strip().lower()
-    except sqlite3.OperationalError:
-        pass
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (35, 35, 35), -1)
+    cv2.rectangle(menu_bg, (50, 50), (750, 550), (0, 215, 255), 2)
 
-    return None
+    cv2.putText(menu_bg, "SAIgn Vision Engine", (160, 150),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.4, (255, 255, 255), 3, cv2.LINE_AA)
+    cv2.putText(menu_bg, "Automated ASL & Expression HUD", (230, 200),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 215, 255), 1, cv2.LINE_AA)
+
+    cv2.rectangle(menu_bg, (150, 280), (650, 350), (50, 50, 50), -1)
+    cv2.putText(menu_bg, "[ SPACE / ENTER ] Start Recognition", (170, 325),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 127), 2, cv2.LINE_AA)
+
+    cv2.rectangle(menu_bg, (150, 380), (650, 450), (50, 50, 50), -1)
+    cv2.putText(menu_bg, "[ ESC ] Shut Down Engine", (240, 425),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 127, 255), 2, cv2.LINE_AA)
+
+    cv2.imshow(window_name, menu_bg)
+
+    while True:
+        key = cv2.waitKey(30) & 0xFF
+        if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+            return 'QUIT'
+        elif key in (13, 32):
+            cv2.destroyAllWindows()
+            cv2.waitKey(1)
+            return 'START'
 
 
-def is_valid_cached_npy(npy_path):
-    """Checks that an existing .npy file is readable and matches (TARGET_FRAMES, FEATURE_DIM)."""
-    if not os.path.exists(npy_path):
-        return False
-    try:
-        arr = np.load(npy_path)
-        return arr.shape == (TARGET_FRAMES, FEATURE_DIM)
-    except (OSError, ValueError):
-        return False
+def run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, sequence_length):
+    window_name = 'SAIgn - Live Recognition Engine'
+    labels = trained_labels if trained_labels else ['UNKNOWN']
 
-
-def register_and_process_dataset():
-    if not os.path.exists(DATASET_DIR):
-        os.makedirs(DATASET_DIR, exist_ok=True)
-        print(f"[WARN] Dataset directory was missing and created at {DATASET_DIR}.")
-        return
-
-    os.makedirs(FEATURES_DIR, exist_ok=True)
     mp_holistic = mp.solutions.holistic
+    mp_drawing = mp.solutions.drawing_utils
 
-    conn = sqlite3.connect(DB_PATH)
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        raise RuntimeError(
+            "Could not open webcam (camera index 0). "
+            "Verify that no other app is using the camera and macOS Camera permissions are granted."
+        )
+
+    raw_buffer = deque(maxlen=max(RAW_CAPTURE_WINDOW, sequence_length))
+    prediction_history = deque(maxlen=DEBOUNCE_WINDOW_SIZE)
+
+    current_gesture = "Waiting..."
+    confidence = 0.0
+
     try:
-        cursor = conn.cursor()
-        ensure_tables_exist(cursor)
-        conn.commit()
+        with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    print("[WARN] Failed to read frame from webcam. Ending capture session.")
+                    break
 
-        with mp_holistic.Holistic(
-            static_image_mode=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        ) as holistic_extractor:
+                image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                image.flags.writeable = False
+                results = holistic.process(image)
 
-            for label_dir in sorted(os.listdir(DATASET_DIR)):
-                label_path = os.path.join(DATASET_DIR, label_dir)
-                if not os.path.isdir(label_path) or label_dir.startswith('.'):
-                    continue
+                image.flags.writeable = True
+                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
 
-                for video_file in sorted(os.listdir(label_path)):
-                    if not video_file.lower().endswith(VALID_VIDEO_EXTS):
-                        continue
+                mp_drawing.draw_landmarks(image, results.left_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
+                mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
 
-                    video_path = os.path.join(label_path, video_file)
-                    feature_filename = f"{os.path.splitext(video_file)[0]}_landmarks.npy"
-                    output_feature_path = os.path.join(FEATURES_DIR, feature_filename)
+                keypoints = extract_landmarks(results)
+                raw_buffer.append(keypoints)
 
-                    split_tag = resolve_split_tag(cursor, video_file)
-                    if not split_tag:
-                        continue
+                if len(raw_buffer) >= sequence_length:
+                    aligned_seq = prepare_live_sequence(raw_buffer, target_frames=sequence_length)
+                    input_tensor = np.expand_dims(aligned_seq, axis=0)
+                    res = model.predict(input_tensor, verbose=0)[0]
+                    prediction_idx = int(np.argmax(res))
+                    confidence = float(res[prediction_idx])
 
-                    if is_valid_cached_npy(output_feature_path):
-                        cursor.execute("""
-                            INSERT OR REPLACE INTO training_dataset
-                            (video_path, label, num_frames, extracted_features_path, npy_path, split)
-                            VALUES (?, ?, ?, ?, ?, ?);
-                        """, (video_path, label_dir, TARGET_FRAMES, output_feature_path, output_feature_path, split_tag))
-                        conn.commit()
-                        continue
+                    raw_label = labels[prediction_idx] if prediction_idx < len(labels) else "UNKNOWN"
 
-                    holistic_extractor.reset()
-                    raw_features = extract_video_landmarks(video_path, holistic_extractor)
-                    if len(raw_features) == 0:
-                        continue
+                    cached_data = gesture_cache.get(raw_label, {
+                        'display_name': raw_label.replace('_', ' ').title(),
+                        'min_score': 0.40
+                    })
 
-                    segmented_features = apply_velocity_segmentation(raw_features)
-                    fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
+                    if confidence >= cached_data['min_score']:
+                        frame_candidate = cached_data['display_name']
+                    else:
+                        frame_candidate = "Uncertain"
 
-                    np.save(output_feature_path, fixed_features)
+                    prediction_history.append(frame_candidate)
 
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO training_dataset
-                        (video_path, label, num_frames, extracted_features_path, npy_path, split)
-                        VALUES (?, ?, ?, ?, ?, ?);
-                    """, (video_path, label_dir, len(fixed_features), output_feature_path, output_feature_path, split_tag))
-                    conn.commit()
+                    vote_counts = Counter(prediction_history)
+                    most_common_gesture, vote_count = vote_counts.most_common(1)[0]
+
+                    if vote_count >= DEBOUNCE_CONSENSUS_COUNT:
+                        current_gesture = most_common_gesture
+
+                active_expressions = detect_expressions(results, expression_thresholds)
+                emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
+
+                hud_color = get_confidence_color(confidence)
+
+                cv2.rectangle(image, (10, 10), (480, 110), (30, 30, 30), -1)
+                cv2.rectangle(image, (10, 10), (480, 110), hud_color, 2)
+
+                cv2.putText(image, f"Sign: {current_gesture} ({confidence*100:.1f}%)",
+                            (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, hud_color, 2, cv2.LINE_AA)
+                cv2.putText(image, emotion_text,
+                            (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
+
+                cv2.imshow(window_name, image)
+
+                key = cv2.waitKey(10) & 0xFF
+                if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                    break
     finally:
-        conn.close()
+        cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
 
 
-def load_split_data(split_name, db_path=DB_PATH):
-    if not os.path.exists(db_path):
-        return []
-    conn = sqlite3.connect(db_path)
-    try:
-        cursor = conn.cursor()
-        query = "SELECT npy_path, label FROM training_dataset WHERE split = ? AND npy_path IS NOT NULL AND label IS NOT NULL"
-        return cursor.execute(query, (split_name,)).fetchall()
-    except sqlite3.OperationalError:
-        return []
-    finally:
-        conn.close()
+# ==============================================================================
+# MAIN PROGRAM EXECUTION ENTRY POINT
+# ==============================================================================
+def main():
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"Model file not found at {MODEL_PATH}. "
+            "Please run P4_train_model_4.py to generate the trained model."
+        )
 
+    model = load_model(MODEL_PATH)
 
-def prepare_tensors(data_list, expected_shape=(TARGET_FRAMES, FEATURE_DIM)):
-    """
-    Reads .npy files from disk and structures them into uniform X (features) and y (labels) arrays.
-    """
-    X, y = [], []
-    skipped = 0
+    input_shape = model.input_shape
+    if isinstance(input_shape, list):
+        input_shape = input_shape[0]
 
-    for npy_path, label in data_list:
-        if not npy_path or not os.path.exists(npy_path):
-            skipped += 1
-            continue
+    seq_len = input_shape[1] or SEQUENCE_LENGTH
+    feature_dim = input_shape[2]
+    if feature_dim != EXPECTED_FEATURE_DIM:
+        raise ValueError(
+            f"Model feature dimension mismatch: '{MODEL_PATH}' expects {feature_dim} features per frame, "
+            f"but Holistic extraction produces {EXPECTED_FEATURE_DIM}. Re-extract features and retrain the model."
+        )
 
-        try:
-            features = np.load(npy_path)
-        except (OSError, ValueError) as e:
-            print(f"[WARN] Failed to load '{npy_path}': {e}. Skipping...")
-            skipped += 1
-            continue
+    model_num_classes = model.output_shape[-1]
 
-        if features.shape != expected_shape:
-            print(f"[WARN] Shape mismatch in '{npy_path}': got {features.shape}, expected {expected_shape}. Skipping...")
-            skipped += 1
-            continue
+    while True:
+        trained_labels, gesture_cache, expression_thresholds = load_db_cache()
+        if trained_labels and len(trained_labels) != model_num_classes:
+            print(
+                f"[WARN] Loaded {len(trained_labels)} class label(s), "
+                f"but model outputs {model_num_classes} class(es). Retrain the model if labels changed."
+            )
 
-        features = np.nan_to_num(features.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
-        X.append(features)
-        y.append(label)
+        action = show_main_menu()
 
-    if skipped > 0:
-        print(f"[WARN] Skipped {skipped} missing, corrupted, or shape-mismatched feature file(s).")
-
-    if not X:
-        return np.empty((0, *expected_shape), dtype=np.float32), np.array([], dtype=str)
-
-    return np.array(X, dtype=np.float32), np.array(y)
+        if action == 'QUIT':
+            print("Exiting SAIgn Engine cleanly. Goodbye!")
+            break
+        elif action == 'START':
+            run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, seq_len)
 
 
 if __name__ == "__main__":
-    # Step 1: Execute feature extraction pipeline
-    print("Verifying feature extraction status...")
-    register_and_process_dataset()
-
-    # Step 2: Retrieve partitioned dataset samples for model training & evaluation
-    print("\n--- Loading Dataset Splits from DB ---")
-    train_data = load_split_data('train')
-    val_data   = load_split_data('val')
-    test_data  = load_split_data('test')
-
-    print(f"Training clips found: {len(train_data)}")
-    print(f"Validation clips found: {len(val_data)}")
-    print(f"Testing clips found: {len(test_data)}")
-
-    if len(train_data) == 0:
-        print("No training data found. Exiting.")
-        exit()
-
-    # Step 3: Convert File Paths to NumPy Matrices
-    print("\nLoading NumPy features into memory...")
-    X_train, y_train_str = prepare_tensors(train_data)
-    X_val, y_val_str     = prepare_tensors(val_data)
-    X_test, y_test_str   = prepare_tensors(test_data)
-
-    if len(X_train) == 0:
-        raise RuntimeError(
-            "Zero valid training feature tensors could be loaded from disk. "
-            "Verify that .npy files exist in 'extracted_features/' with shape (30, 225)."
-        )
-
-    # Step 4: One-Hot Encode the String Labels
-    label_encoder = LabelEncoder()
-    label_splits = [arr for arr in (y_train_str, y_val_str, y_test_str) if len(arr) > 0]
-    all_labels = np.concatenate(label_splits)
-    label_encoder.fit(all_labels)
-
-    num_classes = len(label_encoder.classes_)
-    if num_classes < 2:
-        print(f"[WARN] Only {num_classes} unique sign class found in dataset. Add at least 2 classes for meaningful classification.")
-
-    y_train = to_categorical(label_encoder.transform(y_train_str), num_classes=num_classes)
-
-    has_validation = len(X_val) > 0
-    if has_validation:
-        y_val = to_categorical(label_encoder.transform(y_val_str), num_classes=num_classes)
-        validation_tuple = (X_val, y_val)
-        monitor_metric = 'val_loss'
-    else:
-        print("[WARN] No valid validation tensors found. Training without validation split (monitoring training 'loss').")
-        validation_tuple = None
-        monitor_metric = 'loss'
-
-    sequence_length = X_train.shape[1]  # 30 frames
-    feature_dim = X_train.shape[2]      # 225 Holistic features
-
-    # Step 5: Define LSTM + Temporal Attention Architecture
-    print("\n--- Building LSTM + Attention Neural Network ---")
-    inputs = Input(shape=(sequence_length, feature_dim))
-
-    x = LSTM(64, return_sequences=True)(inputs)
-    x = LSTM(128, return_sequences=True)(x)
-
-    attention_out = Attention()([x, x])
-
-    x = GlobalAveragePooling1D()(attention_out)
-    x = Dropout(0.2)(x)
-    x = Dense(64, activation='relu')(x)
-    outputs = Dense(num_classes, activation='softmax')(x)
-
-    model = Model(inputs=inputs, outputs=outputs)
-    model.compile(optimizer='Adam', loss='categorical_crossentropy', metrics=['categorical_accuracy'])
-
-    # Step 6: Define Early Stopping Callback
-    early_stopping = EarlyStopping(
-        monitor=monitor_metric,
-        patience=15,
-        restore_best_weights=True,
-        verbose=1
-    )
-
-    # Step 7: Train the Model
-    print("\n--- Commencing Training ---")
-    history = model.fit(
-        X_train,
-        y_train,
-        validation_data=validation_tuple,
-        epochs=150,
-        callbacks=[early_stopping],
-        batch_size=32
-    )
-
-    # Step 8: Save Model & Frozen Class Index Mapping
-    model.save(MODEL_PATH)
-    with open(CLASSES_PATH, 'w', encoding='utf-8') as f:
-        json.dump(label_encoder.classes_.tolist(), f, indent=2)
-
-    print(f"\nModel successfully saved to {MODEL_PATH}")
-    print(f"Class label mapping ({num_classes} classes) saved to {CLASSES_PATH}")
+    main()
