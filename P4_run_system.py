@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 from collections import deque, Counter
@@ -5,6 +6,7 @@ import cv2
 import numpy as np
 from keras.models import load_model
 import mediapipe as mp
+from scipy.interpolate import interp1d
 
 # ==============================================================================
 # PATHS & SYSTEM CONFIGURATION
@@ -12,22 +14,57 @@ import mediapipe as mp
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
+CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 
 SEQUENCE_LENGTH = 30
+RAW_CAPTURE_WINDOW = 45  # ~1.5s rolling capture buffer before velocity segmentation + resampling
+VELOCITY_THRESHOLD = 0.015
+MIN_ACTIVE_FRAMES = 10
 EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
+
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
 
 
 # ==============================================================================
-# HELPER FUNCTIONS: DATABASE & DATA PROCESSING
+# HELPER FUNCTIONS: DATABASE, LABELS & SIGNAL PROCESSING
 # ==============================================================================
+def load_trained_classes():
+    """
+    Loads the frozen class index array saved during training (classes.json),
+    falling back to alphabetical unique labels from SQLite if classes.json is missing.
+    """
+    if os.path.exists(CLASSES_PATH):
+        try:
+            with open(CLASSES_PATH, 'r', encoding='utf-8') as f:
+                classes = json.load(f)
+                if isinstance(classes, list) and classes:
+                    return classes
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"[WARN] Could not parse {CLASSES_PATH} ({e}). Falling back to SQLite...")
+
+    if os.path.exists(DB_PATH):
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC;")
+            rows = cursor.fetchall()
+            if rows:
+                return [row[0] for row in rows]
+        except sqlite3.OperationalError:
+            pass
+        finally:
+            conn.close()
+
+    return []
+
+
 def load_db_cache():
     """
-    Loads trained class labels (sorted alphabetically to match LabelEncoder),
-    display name mappings, and facial expression thresholds from SQLite.
+    Loads display name mappings, confidence thresholds, and facial expression
+    thresholds from SQLite.
     """
-    trained_labels = []
+    trained_labels = load_trained_classes()
     gesture_cache = {}
     expression_thresholds = {}
 
@@ -38,16 +75,6 @@ def load_db_cache():
     try:
         cursor = conn.cursor()
 
-        # 1. Load trained class order matching sklearn LabelEncoder().fit()
-        try:
-            cursor.execute(
-                "SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC;"
-            )
-            trained_labels = [row[0] for row in cursor.fetchall()]
-        except sqlite3.OperationalError:
-            pass
-
-        # 2. Load display names and confidence thresholds
         try:
             cursor.execute("SELECT raw_label, display_name, min_score FROM gesture_mappings;")
             for raw_label, display_name, min_score in cursor.fetchall():
@@ -60,7 +87,6 @@ def load_db_cache():
         except sqlite3.OperationalError:
             pass
 
-        # 3. Load facial expression activation thresholds
         try:
             cursor.execute("SELECT blendshape_name, display_name, activation_threshold FROM expression_thresholds;")
             for blendshape, display_name, threshold in cursor.fetchall():
@@ -75,7 +101,6 @@ def load_db_cache():
     finally:
         conn.close()
 
-    # Fallback if training_dataset was cleared while gesture_mappings still exists
     if not trained_labels and gesture_cache:
         trained_labels = sorted(gesture_cache.keys())
 
@@ -104,8 +129,41 @@ def extract_landmarks(results):
     rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
         if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
 
-    # 99 + 63 + 63 = 225
     return np.concatenate([pose, lh, rh])
+
+
+def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
+    """
+    Mirrors P4_extract_features_3.py preprocessing on the live rolling window:
+    filters static transition frames via L2 velocity and resamples active motion
+    to target_frames (30), falling back to the latest 30 raw frames for static signs.
+    """
+    features = np.array(raw_buffer, dtype=np.float32)
+
+    if len(features) >= 2:
+        frame_differences = features[1:] - features[:-1]
+        velocities = np.linalg.norm(frame_differences, axis=1)
+        active_mask = np.ones(len(features), dtype=bool)
+        active_mask[1:] = velocities >= VELOCITY_THRESHOLD
+        filtered = features[active_mask]
+
+        if len(filtered) >= MIN_ACTIVE_FRAMES:
+            features = filtered
+        else:
+            features = features[-target_frames:]
+
+    current_frames = len(features)
+    if current_frames == target_frames:
+        return features
+
+    if current_frames < 2:
+        pad_amount = max(0, target_frames - current_frames)
+        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
+
+    x_old = np.linspace(0, 1, num=current_frames)
+    x_new = np.linspace(0, 1, num=target_frames)
+    interpolator = interp1d(x_old, features, axis=0, kind='linear')
+    return interpolator(x_new).astype(np.float32)
 
 
 def detect_expressions(results, thresholds):
@@ -233,7 +291,6 @@ def show_main_menu():
 
     while True:
         key = cv2.waitKey(30) & 0xFF
-        # Treat manual window 'X' close button the same as ESC
         if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
             cv2.destroyAllWindows()
             cv2.waitKey(1)
@@ -258,7 +315,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
             "Verify that no other app is using the camera and macOS Camera permissions are granted."
         )
 
-    sequence_buffer = deque(maxlen=sequence_length)
+    raw_buffer = deque(maxlen=max(RAW_CAPTURE_WINDOW, sequence_length))
     prediction_history = deque(maxlen=DEBOUNCE_WINDOW_SIZE)
 
     current_gesture = "Waiting..."
@@ -284,10 +341,11 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
 
                 keypoints = extract_landmarks(results)
-                sequence_buffer.append(keypoints)
+                raw_buffer.append(keypoints)
 
-                if len(sequence_buffer) == sequence_length:
-                    input_tensor = np.expand_dims(np.array(sequence_buffer, dtype=np.float32), axis=0)
+                if len(raw_buffer) >= sequence_length:
+                    aligned_seq = prepare_live_sequence(raw_buffer, target_frames=sequence_length)
+                    input_tensor = np.expand_dims(aligned_seq, axis=0)
                     res = model.predict(input_tensor, verbose=0)[0]
                     prediction_idx = int(np.argmax(res))
                     confidence = float(res[prediction_idx])
@@ -343,12 +401,11 @@ def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model file not found at {MODEL_PATH}. "
-            "Please run P4_train_model.py to generate the trained model."
+            "Please run P4_train_model_3.py to generate the trained model."
         )
 
     model = load_model(MODEL_PATH)
 
-    # Validate model input dimensions up front to prevent mid-stream crashes
     input_shape = model.input_shape
     if isinstance(input_shape, list):
         input_shape = input_shape[0]
@@ -367,7 +424,7 @@ def main():
         trained_labels, gesture_cache, expression_thresholds = load_db_cache()
         if trained_labels and len(trained_labels) != model_num_classes:
             print(
-                f"[WARN] Database has {len(trained_labels)} trained label(s), "
+                f"[WARN] Loaded {len(trained_labels)} class label(s), "
                 f"but model outputs {model_num_classes} class(es). Retrain the model if labels changed."
             )
 
