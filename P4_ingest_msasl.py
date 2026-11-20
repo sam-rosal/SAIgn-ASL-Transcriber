@@ -50,6 +50,13 @@ def ingest_data():
             )
         ''')
 
+        # Normalize whitespace in pre-existing URLs before deduplication
+        cursor.execute('''
+            UPDATE video_clips
+            SET url = TRIM(url)
+            WHERE url IS NOT NULL AND url != TRIM(url)
+        ''')
+
         # Clean up any pre-existing duplicates before enforcing the unique index
         cursor.execute('''
             DELETE FROM video_clips
@@ -58,7 +65,7 @@ def ingest_data():
                 FROM video_clips
                 GROUP BY
                     COALESCE(clean_text, ''),
-                    COALESCE(url, ''),
+                    COALESCE(TRIM(url), ''),
                     COALESCE(start_time, -1.0),
                     COALESCE(end_time, -1.0),
                     COALESCE(split, '')
@@ -97,6 +104,9 @@ def ingest_data():
                 if not isinstance(entry, dict):
                     continue
 
+                raw_url = entry.get('url')
+                clean_url = raw_url.strip() if isinstance(raw_url, str) else raw_url
+
                 b_ymin, b_xmin, b_ymax, b_xmax = normalize_box(entry.get('box'))
                 records_to_insert.append((
                     entry.get('clean_text'),
@@ -107,12 +117,13 @@ def ingest_data():
                     entry.get('end_time'),
                     entry.get('start'),
                     entry.get('end'),
-                    entry.get('url'),
+                    clean_url,
                     entry.get('file'),
                     split_name,
                     b_ymin, b_xmin, b_ymax, b_xmax
                 ))
 
+            changes_before = conn.total_changes
             cursor.executemany('''
                 INSERT OR IGNORE INTO video_clips (
                     clean_text, label, signer_id, signer, start_time, end_time,
@@ -120,8 +131,9 @@ def ingest_data():
                     box_ymin, box_xmin, box_ymax, box_xmax
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', records_to_insert)
+            inserted_count = conn.total_changes - changes_before
 
-            print(f"Processed {len(records_to_insert)} items for split: {split_name} (new rows inserted: {cursor.rowcount})")
+            print(f"Processed {len(records_to_insert)} items for split: {split_name} (new rows inserted: {inserted_count})")
 
         conn.commit()
     finally:

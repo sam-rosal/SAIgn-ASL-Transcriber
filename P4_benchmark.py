@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from keras.models import load_model
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # ==============================================================================
 # SYSTEM & PATH CONFIGURATIONS
@@ -31,7 +31,7 @@ def load_all_labels():
             print(f"[WARN] Failed to read {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_4.py first.")
+        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_6.py first.")
 
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -108,7 +108,11 @@ def run_benchmark():
     print("[2] FINAL TEST MODE (Pre-Deployment Holdout)")
     print("==================================================")
 
-    choice = input("Select mode (1 or 2): ").strip()
+    try:
+        choice = input("Select mode (1 or 2): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\nBenchmark cancelled.")
+        return
 
     if choice == '1':
         target_split = 'val'
@@ -117,7 +121,11 @@ def run_benchmark():
     elif choice == '2':
         print("\n[WARNING] You have selected the FINAL TEST holdout split.")
         print("This split should only be evaluated once at the very end of the project cycle.")
-        confirm = input("Are you sure you want to proceed? (y/n): ").strip().lower()
+        try:
+            confirm = input("Are you sure you want to proceed? (y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nTest benchmark cancelled. Returning safely.")
+            return
 
         if confirm != 'y':
             print("\nTest benchmark cancelled. Returning safely.")
@@ -133,7 +141,7 @@ def run_benchmark():
     cm_output_path = os.path.join(SCRIPT_DIR, output_filename)
 
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_4.py first.")
+        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_6.py first.")
 
     print("Loading AI model into memory...")
     model = load_model(MODEL_PATH)
@@ -144,7 +152,7 @@ def run_benchmark():
     print("Synchronizing class mappings...")
     class_names = load_all_labels()
     if not class_names:
-        print("[ERROR] No class labels found. Run P4_train_model_4.py first.")
+        print("[ERROR] No class labels found. Run P4_train_model_6.py first.")
         return
 
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -153,7 +161,7 @@ def run_benchmark():
     if len(class_names) != model_num_classes:
         raise ValueError(
             f"Class count mismatch: model outputs {model_num_classes} classes, "
-            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_4.py."
+            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_6.py."
         )
 
     print(f"Loading '{target_split}' dataset...")
@@ -171,8 +179,10 @@ def run_benchmark():
     y_pred_probs = model.predict(X_test, verbose=0)
     y_pred = np.argmax(y_pred_probs, axis=1)
 
+    overall_acc = accuracy_score(y_true, y_pred)
+
     print("\n" + "=" * 60)
-    print(f"CLASSIFICATION REPORT: {target_split.upper()} SPLIT")
+    print(f"CLASSIFICATION REPORT: {target_split.upper()} SPLIT (Accuracy: {overall_acc * 100:.2f}%)")
     print("=" * 60)
     print(classification_report(
         y_true,
@@ -185,10 +195,14 @@ def run_benchmark():
     print("\nGenerating visual Confusion Matrix...")
     cm = confusion_matrix(y_true, y_pred, labels=class_indices)
 
-    plt.figure(figsize=(12, 10))
+    num_classes = len(class_names)
+    fig_dim = max(10, min(32, int(num_classes * 0.45)))
+    show_annotations = num_classes <= 30
+
+    plt.figure(figsize=(fig_dim + 2, fig_dim))
     sns.heatmap(
         cm,
-        annot=True,
+        annot=show_annotations,
         fmt='d',
         cmap='Blues',
         xticklabels=class_names,

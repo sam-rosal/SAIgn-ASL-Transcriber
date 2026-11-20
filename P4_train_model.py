@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import sys
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -49,6 +50,8 @@ def extract_video_landmarks(video_path, holistic_extractor):
             ret, frame = cap.read()
             if not ret or frame is None:
                 break
+            if frame.size == 0:
+                continue
 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic_extractor.process(rgb_frame)
@@ -64,6 +67,9 @@ def extract_video_landmarks(video_path, holistic_extractor):
 
             frame_coordinates = np.concatenate([pose, lh, rh])
             video_features.append(frame_coordinates)
+    except Exception as e:
+        print(f"[WARN] MediaPipe processing error on '{video_path}': {e}. Skipping...")
+        return np.empty((0, FEATURE_DIM), dtype=np.float32)
     finally:
         cap.release()
 
@@ -100,7 +106,7 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
 
 
 def ensure_tables_exist(cursor):
-    """Ensures training_dataset and its required columns exist even on legacy databases."""
+    """Ensures training_dataset and its required columns/indexes exist even on legacy databases."""
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS training_dataset (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -126,6 +132,18 @@ def ensure_tables_exist(cursor):
         if col_name not in existing_cols:
             cursor.execute(f"ALTER TABLE training_dataset ADD COLUMN {col_name} {col_def};")
 
+    cursor.execute("""
+        DELETE FROM training_dataset
+        WHERE id NOT IN (
+            SELECT MAX(id)
+            FROM training_dataset
+            GROUP BY video_path
+        );
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_training_dataset_video_path
+        ON training_dataset(video_path);
+    """)
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);")
 
 
@@ -156,6 +174,16 @@ def resolve_split_tag(cursor, video_file):
         pass
 
     return None
+
+
+def build_feature_output_path(label_dir, video_file):
+    """Prevents filename collisions in extracted_features/ across different sign directories."""
+    stem = os.path.splitext(video_file)[0]
+    if stem.lower().startswith(f"{label_dir.lower()}_"):
+        feature_filename = f"{stem}_landmarks.npy"
+    else:
+        feature_filename = f"{label_dir}_{stem}_landmarks.npy"
+    return os.path.join(FEATURES_DIR, feature_filename)
 
 
 def is_valid_cached_npy(npy_path):
@@ -200,8 +228,7 @@ def register_and_process_dataset():
                         continue
 
                     video_path = os.path.join(label_path, video_file)
-                    feature_filename = f"{os.path.splitext(video_file)[0]}_landmarks.npy"
-                    output_feature_path = os.path.join(FEATURES_DIR, feature_filename)
+                    output_feature_path = build_feature_output_path(label_dir, video_file)
 
                     split_tag = resolve_split_tag(cursor, video_file)
                     if not split_tag:
@@ -305,7 +332,7 @@ if __name__ == "__main__":
 
     if len(train_data) == 0:
         print("No training data found. Exiting.")
-        exit()
+        sys.exit(1)
 
     # Step 3: Convert File Paths to NumPy Matrices
     print("\nLoading NumPy features into memory...")
@@ -324,6 +351,14 @@ if __name__ == "__main__":
     label_splits = [arr for arr in (y_train_str, y_val_str, y_test_str) if len(arr) > 0]
     all_labels = np.concatenate(label_splits)
     label_encoder.fit(all_labels)
+
+    train_label_set = set(y_train_str.tolist())
+    unseen_eval_labels = sorted(set(all_labels.tolist()) - train_label_set)
+    if unseen_eval_labels:
+        print(
+            f"[WARN] {len(unseen_eval_labels)} class(es) appear in val/test with 0 training clips: "
+            f"{unseen_eval_labels[:10]}"
+        )
 
     num_classes = len(label_encoder.classes_)
     if num_classes < 2:

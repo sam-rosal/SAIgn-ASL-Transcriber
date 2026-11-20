@@ -11,7 +11,7 @@ FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
 
 
 def ensure_training_dataset_columns(cursor):
-    """Migrates older training_dataset tables so required columns exist before indexing."""
+    """Migrates older training_dataset tables so required columns and unique indexes exist."""
     existing_cols = {
         row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
     }
@@ -24,6 +24,20 @@ def ensure_training_dataset_columns(cursor):
     for col_name, col_def in required_columns.items():
         if col_name not in existing_cols:
             cursor.execute(f"ALTER TABLE training_dataset ADD COLUMN {col_name} {col_def};")
+
+    # Deduplicate legacy rows before enforcing UNIQUE index on video_path
+    cursor.execute("""
+        DELETE FROM training_dataset
+        WHERE id NOT IN (
+            SELECT MAX(id)
+            FROM training_dataset
+            GROUP BY video_path
+        );
+    """)
+    cursor.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_training_dataset_video_path
+        ON training_dataset(video_path);
+    """)
 
 
 def init_system():

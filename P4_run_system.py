@@ -24,6 +24,7 @@ EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
 
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
+NO_HAND_RESET_FRAMES = 15  # Reset active sign display after ~0.5s with no hands visible
 
 
 # ==============================================================================
@@ -134,7 +135,7 @@ def extract_landmarks(results):
 
 def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     """
-    Mirrors P4_extract_features_4.py preprocessing on the live rolling window:
+    Mirrors P4_extract_features_6.py preprocessing on the live rolling window:
     filters static transition frames via L2 velocity and resamples active motion
     to target_frames (30), falling back to the latest 30 raw frames for static signs.
     """
@@ -154,7 +155,7 @@ def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
 
     current_frames = len(features)
     if current_frames == target_frames:
-        return features
+        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
     if current_frames < 2:
         pad_amount = max(0, target_frames - current_frames)
@@ -163,7 +164,7 @@ def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     x_old = np.linspace(0, 1, num=current_frames)
     x_new = np.linspace(0, 1, num=target_frames)
     interpolator = interp1d(x_old, features, axis=0, kind='linear')
-    return interpolator(x_new).astype(np.float32)
+    return np.nan_to_num(interpolator(x_new).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def detect_expressions(results, thresholds):
@@ -172,6 +173,8 @@ def detect_expressions(results, thresholds):
         return active_emotions
 
     landmarks = results.face_landmarks.landmark
+    if len(landmarks) < 468:
+        return active_emotions
 
     # Brow furrow / squint (check stricter threshold 0.020 before 0.025)
     if 'browLowerer' in thresholds or 'browSquint' in thresholds:
@@ -264,6 +267,14 @@ def detect_expressions(results, thresholds):
     return active_emotions
 
 
+def is_window_closed(window_name):
+    """Safely checks whether an OpenCV window has been closed by the user."""
+    try:
+        return cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
 # ==============================================================================
 # GUI SCREENS & STATE MANAGERS
 # ==============================================================================
@@ -291,7 +302,7 @@ def show_main_menu():
 
     while True:
         key = cv2.waitKey(30) & 0xFF
-        if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+        if key == 27 or is_window_closed(window_name):
             cv2.destroyAllWindows()
             cv2.waitKey(1)
             return 'QUIT'
@@ -320,6 +331,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
 
     current_gesture = "Waiting..."
     confidence = 0.0
+    no_hand_frames = 0
 
     try:
         with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
@@ -340,13 +352,23 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 mp_drawing.draw_landmarks(image, results.right_hand_landmarks, mp_holistic.HAND_CONNECTIONS)
                 mp_drawing.draw_landmarks(image, results.pose_landmarks, mp_holistic.POSE_CONNECTIONS)
 
+                hands_visible = bool(results.left_hand_landmarks or results.right_hand_landmarks)
+                if hands_visible:
+                    no_hand_frames = 0
+                else:
+                    no_hand_frames += 1
+
                 keypoints = extract_landmarks(results)
                 raw_buffer.append(keypoints)
 
-                if len(raw_buffer) >= sequence_length:
+                if no_hand_frames >= NO_HAND_RESET_FRAMES:
+                    current_gesture = "Waiting..."
+                    confidence = 0.0
+                    prediction_history.clear()
+                elif len(raw_buffer) >= sequence_length and hands_visible:
                     aligned_seq = prepare_live_sequence(raw_buffer, target_frames=sequence_length)
                     input_tensor = np.expand_dims(aligned_seq, axis=0)
-                    res = model.predict(input_tensor, verbose=0)[0]
+                    res = model(input_tensor, training=False).numpy()[0]
                     prediction_idx = int(np.argmax(res))
                     confidence = float(res[prediction_idx])
 
@@ -386,7 +408,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 cv2.imshow(window_name, image)
 
                 key = cv2.waitKey(10) & 0xFF
-                if key == 27 or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                if key == 27 or is_window_closed(window_name):
                     break
     finally:
         cap.release()
@@ -401,7 +423,7 @@ def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model file not found at {MODEL_PATH}. "
-            "Please run P4_train_model_4.py to generate the trained model."
+            "Please run P4_train_model_6.py to generate the trained model."
         )
 
     model = load_model(MODEL_PATH)

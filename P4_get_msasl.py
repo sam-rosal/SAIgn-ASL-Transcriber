@@ -1,3 +1,4 @@
+import glob
 import os
 import json
 import re
@@ -124,21 +125,28 @@ def get_youtube_id(url):
     """
     if not isinstance(url, str) or not url:
         return None
-    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})", url)
+    match = re.search(r"(?:v=|\/)([0-9A-Za-z_-]{11})(?:[&#?/]|$)", url)
     return match.group(1) if match else None
 
 
-def get_clip_key(entry, idx):
-    """Generates a unique identifier for a metadata entry to avoid duplicate downloads."""
-    url = entry.get('url') or ''
+def get_clip_keys(entry):
+    """
+    Returns (primary_key, legacy_key) for a metadata entry so sub-second clips
+    do not collide while preserving compatibility with existing manifests.
+    """
+    url = (entry.get('url') or '').strip()
     start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
     end_time = parse_timestamp(entry.get('end_time'), 0.0) or 0.0
+    split_tag = (entry.get('split') or 'train').strip().lower()
 
     yt_id = get_youtube_id(url)
     if yt_id:
-        return f"{yt_id}_{int(start_time)}_{int(end_time)}"
-    split_tag = entry.get('split') or 'train'
-    return f"msasl_{idx}_{split_tag}"
+        primary = f"{yt_id}_{round(start_time, 3)}_{round(end_time, 3)}_{split_tag}"
+        legacy = f"{yt_id}_{int(start_time)}_{int(end_time)}"
+        return primary, legacy
+
+    primary = f"{url}_{round(start_time, 3)}_{round(end_time, 3)}_{split_tag}"
+    return primary, primary
 
 
 def load_download_manifest():
@@ -163,7 +171,7 @@ def save_download_manifest(manifest):
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_4.py).
+    saign_vision.db (populated by P4_ingest_msasl_6.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -184,7 +192,7 @@ def load_db_split_tags():
             et = parse_timestamp(end_time, 0.0)
             if st is None or et is None:
                 continue
-            key = (norm_text, url or '', round(st, 3), round(et, 3))
+            key = (norm_text, (url or '').strip(), round(st, 3), round(et, 3))
             tag_lookup[key] = (split or 'train').strip().lower()
     except sqlite3.Error:
         pass
@@ -242,7 +250,7 @@ def get_next_video_number(folder_path, sign_name):
     return max(max_num, total_videos) + 1
 
 
-def is_clip_handled(folder_name, folder_path, clip_key, manifest, retry_failed=RETRY_FAILED):
+def is_clip_handled(folder_name, folder_path, clip_keys, manifest, retry_failed=RETRY_FAILED):
     """
     Checks if a clip is already downloaded on disk or marked as permanently failed
     so dead YouTube links do not stall the download queue forever.
@@ -251,15 +259,21 @@ def is_clip_handled(folder_name, folder_path, clip_key, manifest, retry_failed=R
     if not isinstance(folder_manifest, dict):
         return False
 
-    entry_status = folder_manifest.get(clip_key)
-    if not entry_status:
-        return False
+    for key in clip_keys:
+        entry_status = folder_manifest.get(key)
+        if not entry_status:
+            continue
 
-    if entry_status == FAILED_MARKER:
-        return not retry_failed
+        if entry_status == FAILED_MARKER:
+            if not retry_failed:
+                return True
+            continue
 
-    full_path = os.path.join(folder_path, entry_status)
-    return os.path.isfile(full_path) and os.path.getsize(full_path) > 0
+        full_path = os.path.join(folder_path, entry_status)
+        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+            return True
+
+    return False
 
 
 def load_and_filter_metadata(priority_map, min_samples=3):
@@ -337,9 +351,9 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         existing_count = count_local_videos(folder_path)
 
         pending_count = 0
-        for idx, entry in enumerate(entries):
-            clip_key = get_clip_key(entry, idx)
-            if not is_clip_handled(folder_name, folder_path, clip_key, manifest):
+        for entry in entries:
+            clip_keys = get_clip_keys(entry)
+            if not is_clip_handled(folder_name, folder_path, clip_keys, manifest):
                 pending_count += 1
 
         total_potential = existing_count + pending_count
@@ -357,6 +371,17 @@ def load_and_filter_metadata(priority_map, min_samples=3):
     return valid_dataset
 
 
+def cleanup_partial_files(output_path):
+    """Removes incomplete download fragments matching output_path.* on failure."""
+    stem, _ = os.path.splitext(output_path)
+    for candidate in glob.glob(f"{glob.escape(stem)}*"):
+        if os.path.isfile(candidate):
+            try:
+                os.remove(candidate)
+            except OSError:
+                pass
+
+
 def download_clip(url, start_time, end_time, output_path):
     """Streams and trims YouTube clip with yt-dlp + ffmpeg."""
     if not url or float(end_time) <= float(start_time):
@@ -371,7 +396,9 @@ def download_clip(url, start_time, end_time, output_path):
         "yt-dlp",
         "--quiet",
         "--no-warnings",
-        "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]",
+        "--no-playlist",
+        "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
         "--external-downloader", "ffmpeg",
         "--external-downloader-args", f"ffmpeg_i:-ss {start_time} -to {end_time}",
         "-o", output_path,
@@ -385,13 +412,7 @@ def download_clip(url, start_time, end_time, output_path):
     except Exception:
         pass
 
-    for temp_path in (output_path, f"{output_path}.part"):
-        if os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError:
-                pass
-
+    cleanup_partial_files(output_path)
     return False
 
 
@@ -424,10 +445,10 @@ def fetch_msasl_dataset():
         is_priority = norm_name in priority_map
 
         pending = []
-        for idx, entry in enumerate(entries):
-            clip_key = get_clip_key(entry, idx)
-            if not is_clip_handled(folder_name, label_dir, clip_key, manifest):
-                pending.append((entry, clip_key))
+        for entry in entries:
+            clip_keys = get_clip_keys(entry)
+            if not is_clip_handled(folder_name, label_dir, clip_keys, manifest):
+                pending.append((entry, clip_keys[0]))
 
         if pending:
             classes_with_pending.append({
