@@ -24,9 +24,13 @@ JSON_FILES = [
 MIN_VIDEOS_PER_CLASS = 3
 BATCH_SIZE_CLASSES = 10  # Process 10 sign classes per execution run
 VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
+FAILED_MARKER = "__FAILED__"
 
 # Set to True to download ONLY signs listed in priority_signs.txt and ignore the rest of MS-ASL
 ONLY_DOWNLOAD_PRIORITY = False
+
+# Set to True to re-attempt previously failed/unavailable YouTube clips
+RETRY_FAILED = False
 
 # Used strictly to auto-create priority_signs.txt on first run if the file does not exist
 DEFAULT_PRIORITY_VOCAB = {
@@ -130,7 +134,7 @@ def get_clip_key(entry, idx):
 
 
 def load_download_manifest():
-    """Loads the record of already-downloaded clip keys mapped to their local filenames."""
+    """Loads the record of already-attempted clip keys mapped to their local filenames or failure status."""
     if os.path.exists(MANIFEST_PATH):
         try:
             with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
@@ -151,7 +155,7 @@ def save_download_manifest(manifest):
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_2.py).
+    saign_vision.db (populated by P4_ingest_msasl_3.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -231,17 +235,24 @@ def get_next_video_number(folder_path, sign_name):
     return max(max_num, total_videos) + 1
 
 
-def is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
-    """Checks if a non-empty clip is already recorded in the manifest and present on disk."""
+def is_clip_handled(folder_name, folder_path, clip_key, manifest, retry_failed=RETRY_FAILED):
+    """
+    Checks if a clip is already downloaded on disk or marked as permanently failed
+    so dead YouTube links do not stall the download queue forever.
+    """
     folder_manifest = manifest.get(folder_name)
     if not isinstance(folder_manifest, dict):
         return False
-    saved_filename = folder_manifest.get(clip_key)
-    if saved_filename:
-        full_path = os.path.join(folder_path, saved_filename)
-        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
-            return True
-    return False
+
+    entry_status = folder_manifest.get(clip_key)
+    if not entry_status:
+        return False
+
+    if entry_status == FAILED_MARKER:
+        return not retry_failed
+
+    full_path = os.path.join(folder_path, entry_status)
+    return os.path.isfile(full_path) and os.path.getsize(full_path) > 0
 
 
 def load_and_filter_metadata(priority_map, min_samples=3):
@@ -295,7 +306,6 @@ def load_and_filter_metadata(priority_map, min_samples=3):
             if end_time <= start_time:
                 continue
 
-            # Prefer the split tag ingested in DB, fallback to source JSON split
             db_key = (
                 raw_text,
                 url,
@@ -322,7 +332,7 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         pending_count = 0
         for idx, entry in enumerate(entries):
             clip_key = get_clip_key(entry, idx)
-            if not is_clip_downloaded(folder_name, folder_path, clip_key, manifest):
+            if not is_clip_handled(folder_name, folder_path, clip_key, manifest):
                 pending_count += 1
 
         total_potential = existing_count + pending_count
@@ -368,7 +378,6 @@ def download_clip(url, start_time, end_time, output_path):
     except Exception:
         pass
 
-    # Clean up empty or partial file if download failed
     if os.path.exists(output_path):
         try:
             os.remove(output_path)
@@ -409,7 +418,7 @@ def fetch_msasl_dataset():
         pending = []
         for idx, entry in enumerate(entries):
             clip_key = get_clip_key(entry, idx)
-            if not is_clip_downloaded(folder_name, label_dir, clip_key, manifest):
+            if not is_clip_handled(folder_name, label_dir, clip_key, manifest):
                 pending.append((entry, clip_key))
 
         if pending:
@@ -422,7 +431,7 @@ def fetch_msasl_dataset():
             })
 
     if not classes_with_pending:
-        print("\nAll eligible sign classes are already fully downloaded!")
+        print("\nAll eligible sign classes are already processed!")
         return
 
     classes_with_pending.sort(
@@ -454,6 +463,7 @@ def fetch_msasl_dataset():
         print(f"[{c_idx}/{len(batch_classes)}] {tier_tag} Sign Class: '{folder_name}' (Existing on disk: {item['existing_count']}, Pending in batch: {len(item['pending'])})")
 
         success_count = 0
+        failed_count = 0
         for entry, clip_key in item['pending']:
             url = (entry.get('url') or '').strip()
             start_time = float(entry.get('start_time') or 0)
@@ -468,10 +478,16 @@ def fetch_msasl_dataset():
                 manifest[folder_name][clip_key] = file_name
                 success_count += 1
                 next_num += 1
+            else:
+                manifest[folder_name][clip_key] = FAILED_MARKER
+                failed_count += 1
 
         save_download_manifest(manifest)
         total_now = count_local_videos(label_dir)
-        print(f"   -> Successfully downloaded {success_count}/{len(item['pending'])} new clips. Current total in folder: {total_now}\n")
+        print(
+            f"   -> Downloaded {success_count}/{len(item['pending'])} new clips "
+            f"({failed_count} unavailable/failed). Current total in folder: {total_now}\n"
+        )
 
     remaining_classes = len(classes_with_pending) - len(batch_classes)
     remaining_priority = sum(1 for x in classes_with_pending[BATCH_SIZE_CLASSES:] if x['is_priority'])
