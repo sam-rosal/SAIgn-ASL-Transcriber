@@ -40,14 +40,14 @@ def extract_video_landmarks(video_path, holistic_extractor):
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic_extractor.process(rgb_frame)
 
-            pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark]).flatten() \
-                if results.pose_landmarks else np.zeros(33 * 3)
+            pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
+                if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
 
-            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark]).flatten() \
-                if results.left_hand_landmarks else np.zeros(21 * 3)
+            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
+                if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
 
-            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark]).flatten() \
-                if results.right_hand_landmarks else np.zeros(21 * 3)
+            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
+                if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
 
             frame_coordinates = np.concatenate([pose, lh, rh])
             video_features.append(frame_coordinates)
@@ -57,7 +57,7 @@ def extract_video_landmarks(video_path, holistic_extractor):
     if not video_features:
         return np.empty((0, FEATURE_DIM), dtype=np.float32)
 
-    return np.array(video_features, dtype=np.float32)
+    return np.nan_to_num(np.array(video_features, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def apply_velocity_segmentation(features, threshold=VELOCITY_THRESHOLD, min_frames=MIN_ACTIVE_FRAMES):
@@ -84,11 +84,11 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
     current_frames = len(features)
 
     if current_frames == target_frames:
-        return features
+        return features.astype(np.float32)
 
     if current_frames < 2:
         pad_amount = max(0, target_frames - current_frames)
-        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
+        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames].astype(np.float32)
 
     x_old = np.linspace(0, 1, num=current_frames)
     x_new = np.linspace(0, 1, num=target_frames)
@@ -159,6 +159,7 @@ def register_and_process_dataset():
     try:
         cursor = conn.cursor()
         ensure_tables_exist(cursor)
+        conn.commit()
 
         with mp_holistic.Holistic(
             static_image_mode=False,
@@ -184,19 +185,19 @@ def register_and_process_dataset():
                         print(f"[WARN] No matching split metadata for: {video_file}. Skipping processing...")
                         continue
 
-                    # If valid 225-dim features already exist, re-sync DB row without re-extracting
+                    # If valid 225-dim features already exist, re-sync DB row immediately
                     if is_valid_cached_npy(output_feature_path):
                         cursor.execute("""
                             INSERT OR REPLACE INTO training_dataset
                             (video_path, label, num_frames, extracted_features_path, npy_path, split)
                             VALUES (?, ?, ?, ?, ?, ?);
                         """, (video_path, label_dir, TARGET_FRAMES, output_feature_path, output_feature_path, split_tag))
+                        conn.commit()
                         print(f"Skipping {video_file} - valid 225-dim features already extracted (DB synced).")
                         continue
 
                     print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
 
-                    # Reset temporal tracker state between unrelated video clips
                     holistic_extractor.reset()
                     raw_features = extract_video_landmarks(video_path, holistic_extractor)
                     if len(raw_features) == 0:
@@ -213,8 +214,7 @@ def register_and_process_dataset():
                         (video_path, label, num_frames, extracted_features_path, npy_path, split)
                         VALUES (?, ?, ?, ?, ?, ?);
                     """, (video_path, label_dir, len(fixed_features), output_feature_path, output_feature_path, split_tag))
-
-        conn.commit()
+                    conn.commit()
     finally:
         conn.close()
 
