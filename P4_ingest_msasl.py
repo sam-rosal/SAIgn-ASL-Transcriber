@@ -50,16 +50,21 @@ def ingest_data():
             )
         ''')
 
-        # Prevent duplicate clip rows if the ingestion script is executed multiple times
+        # COALESCE ensures NULL fields are still deduplicated properly in SQLite
         try:
             cursor.execute('''
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_video_clips_unique
-                ON video_clips (clean_text, url, start_time, end_time, split)
+                ON video_clips (
+                    COALESCE(clean_text, ''),
+                    COALESCE(url, ''),
+                    COALESCE(start_time, -1.0),
+                    COALESCE(end_time, -1.0),
+                    COALESCE(split, '')
+                )
             ''')
         except sqlite3.OperationalError:
             pass
 
-        # Ingest records split by split
         for split_name, file_path in json_files.items():
             try:
                 with open(file_path, 'r', encoding='utf-8') as f:
@@ -92,7 +97,7 @@ def ingest_data():
                     entry.get('end'),
                     entry.get('url'),
                     entry.get('file'),
-                    split_name,  # Tag split based on source file
+                    split_name,
                     b_ymin, b_xmin, b_ymax, b_xmax
                 ))
 
