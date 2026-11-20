@@ -12,6 +12,7 @@ from sklearn.metrics import accuracy_score, classification_report, confusion_mat
 # ==============================================================================
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
+FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
 CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 
@@ -31,9 +32,9 @@ def load_all_labels():
             print(f"[WARN] Failed to read {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_6.py first.")
+        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_9.py first.")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
         data = cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC").fetchall()
@@ -49,7 +50,7 @@ def load_benchmark_data(split_name):
     if not os.path.exists(DB_PATH):
         raise FileNotFoundError(f"Database not found at {DB_PATH}.")
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
         return cursor.execute(
@@ -60,18 +61,29 @@ def load_benchmark_data(split_name):
         conn.close()
 
 
+def resolve_npy_path(npy_path):
+    """Resolves .npy file path even if the project folder was moved since extraction."""
+    if not npy_path:
+        return None
+    if os.path.exists(npy_path):
+        return npy_path
+    portable_path = os.path.join(FEATURES_DIR, os.path.basename(npy_path))
+    return portable_path if os.path.exists(portable_path) else None
+
+
 def prepare_tensors(data_list, expected_shape, class_to_idx):
     """Loads .npy feature matrices and integer class indices into uniform NumPy arrays."""
     X, y = [], []
     skipped = 0
 
-    for npy_path, label in data_list:
+    for raw_npy_path, label in data_list:
         if label not in class_to_idx:
             print(f"[WARN] Label '{label}' is not in trained classes.json. Skipping...")
             skipped += 1
             continue
 
-        if not npy_path or not os.path.exists(npy_path):
+        npy_path = resolve_npy_path(raw_npy_path)
+        if not npy_path:
             skipped += 1
             continue
 
@@ -141,18 +153,19 @@ def run_benchmark():
     cm_output_path = os.path.join(SCRIPT_DIR, output_filename)
 
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_6.py first.")
+        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_9.py first.")
 
     print("Loading AI model into memory...")
     model = load_model(MODEL_PATH)
     input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
-    expected_input_shape = tuple(input_shape[1:])
-    model_num_classes = model.output_shape[-1]
+    output_shape = model.output_shape[0] if isinstance(model.output_shape, list) else model.output_shape
+    expected_input_shape = (input_shape[1] or 30, input_shape[2] or 225)
+    model_num_classes = output_shape[-1]
 
     print("Synchronizing class mappings...")
     class_names = load_all_labels()
     if not class_names:
-        print("[ERROR] No class labels found. Run P4_train_model_6.py first.")
+        print("[ERROR] No class labels found. Run P4_train_model_9.py first.")
         return
 
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -161,7 +174,7 @@ def run_benchmark():
     if len(class_names) != model_num_classes:
         raise ValueError(
             f"Class count mismatch: model outputs {model_num_classes} classes, "
-            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_6.py."
+            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_9.py."
         )
 
     print(f"Loading '{target_split}' dataset...")
@@ -223,7 +236,7 @@ def run_benchmark():
     except Exception as e:
         print(f"[WARN] Could not open interactive display window ({e}). Saved chart is at {cm_output_path}.")
     finally:
-        plt.close()
+        plt.close('all')
 
 
 if __name__ == "__main__":

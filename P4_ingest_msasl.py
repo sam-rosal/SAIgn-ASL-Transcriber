@@ -14,17 +14,35 @@ json_files = {
 }
 
 
+def to_float(value):
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def to_int(value):
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def normalize_box(raw_box):
-    """Safely extracts 4 bounding-box coordinates even if 'box' is null or malformed."""
+    """Safely extracts 4 float bounding-box coordinates even if 'box' is null or malformed."""
     if isinstance(raw_box, (list, tuple)):
-        padded = list(raw_box[:4]) + [None] * max(0, 4 - len(raw_box))
+        padded = [to_float(v) for v in raw_box[:4]] + [None] * max(0, 4 - len(raw_box))
         return padded[0], padded[1], padded[2], padded[3]
     return None, None, None, None
 
 
 def ingest_data():
     """Reads JSON files and populates the SQLite database table."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
 
@@ -50,27 +68,31 @@ def ingest_data():
             )
         ''')
 
-        # Normalize whitespace in pre-existing URLs before deduplication
-        cursor.execute('''
-            UPDATE video_clips
-            SET url = TRIM(url)
-            WHERE url IS NOT NULL AND url != TRIM(url)
-        ''')
+        # Only run one-time cleanup migration if the unique index does not exist yet
+        has_unique_idx = cursor.execute("""
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'index' AND name = 'idx_video_clips_unique'
+        """).fetchone() is not None
 
-        # Clean up any pre-existing duplicates before enforcing the unique index
-        cursor.execute('''
-            DELETE FROM video_clips
-            WHERE id NOT IN (
-                SELECT MIN(id)
-                FROM video_clips
-                GROUP BY
-                    COALESCE(clean_text, ''),
-                    COALESCE(TRIM(url), ''),
-                    COALESCE(start_time, -1.0),
-                    COALESCE(end_time, -1.0),
-                    COALESCE(split, '')
-            )
-        ''')
+        if not has_unique_idx:
+            cursor.execute('''
+                UPDATE video_clips
+                SET url = TRIM(url)
+                WHERE url IS NOT NULL AND url != TRIM(url)
+            ''')
+            cursor.execute('''
+                DELETE FROM video_clips
+                WHERE id NOT IN (
+                    SELECT MIN(id)
+                    FROM video_clips
+                    GROUP BY
+                        COALESCE(clean_text, ''),
+                        COALESCE(TRIM(url), ''),
+                        COALESCE(start_time, -1.0),
+                        COALESCE(end_time, -1.0),
+                        COALESCE(split, '')
+                )
+            ''')
 
         # COALESCE ensures NULL fields are still deduplicated properly in SQLite
         cursor.execute('''
@@ -107,16 +129,19 @@ def ingest_data():
                 raw_url = entry.get('url')
                 clean_url = raw_url.strip() if isinstance(raw_url, str) else raw_url
 
+                raw_text = entry.get('clean_text') or entry.get('text')
+                clean_text = raw_text.strip() if isinstance(raw_text, str) else raw_text
+
                 b_ymin, b_xmin, b_ymax, b_xmax = normalize_box(entry.get('box'))
                 records_to_insert.append((
-                    entry.get('clean_text'),
-                    entry.get('label'),
-                    entry.get('signer_id'),
-                    entry.get('signer'),
-                    entry.get('start_time'),
-                    entry.get('end_time'),
-                    entry.get('start'),
-                    entry.get('end'),
+                    clean_text,
+                    to_int(entry.get('label')),
+                    to_int(entry.get('signer_id')),
+                    to_int(entry.get('signer')),
+                    to_float(entry.get('start_time')),
+                    to_float(entry.get('end_time')),
+                    to_int(entry.get('start')),
+                    to_int(entry.get('end')),
                     clean_url,
                     entry.get('file'),
                     split_name,
@@ -146,7 +171,7 @@ def print_split_percentages():
         print("Database file not found. Nothing to summarize.")
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
         query = '''

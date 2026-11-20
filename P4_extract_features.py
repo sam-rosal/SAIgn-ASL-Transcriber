@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import tempfile
 import cv2
 import mediapipe as mp
 import numpy as np
@@ -18,7 +19,59 @@ MIN_ACTIVE_FRAMES = 10
 VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
 
 
-def extract_video_landmarks(video_path, holistic_extractor):
+class HolisticSession:
+    """Manages MediaPipe Holistic lifecycle with automatic recovery if a video corrupts the graph."""
+
+    def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        self._mp_holistic = mp.solutions.holistic
+        self._det_conf = min_detection_confidence
+        self._trk_conf = min_tracking_confidence
+        self._extractor = None
+
+    def _create(self):
+        return self._mp_holistic.Holistic(
+            static_image_mode=False,
+            min_detection_confidence=self._det_conf,
+            min_tracking_confidence=self._trk_conf
+        )
+
+    def __enter__(self):
+        self._extractor = self._create()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        if self._extractor is not None:
+            try:
+                self._extractor.close()
+            except Exception:
+                pass
+            self._extractor = None
+
+    def reset_or_recreate(self):
+        if self._extractor is None:
+            self._extractor = self._create()
+            return
+        try:
+            self._extractor.reset()
+        except Exception:
+            self.close()
+            self._extractor = self._create()
+
+    def process(self, rgb_frame):
+        if self._extractor is None:
+            self._extractor = self._create()
+        try:
+            return self._extractor.process(rgb_frame)
+        except Exception:
+            # Close poisoned C++ graph before re-raising so subsequent videos stay clean
+            self.close()
+            raise
+
+
+def extract_video_landmarks(video_path, holistic_session):
     """
     Reads a video frame-by-frame, runs MediaPipe Holistic tracking, and converts
     detected joint spatial coordinates into a structured NumPy matrix.
@@ -40,7 +93,7 @@ def extract_video_landmarks(video_path, holistic_extractor):
                 continue
 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            results = holistic_extractor.process(rgb_frame)
+            results = holistic_session.process(rgb_frame)
 
             pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
                 if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
@@ -87,6 +140,10 @@ def resample_sequence(features, target_frames=TARGET_FRAMES):
     using 1D linear temporal interpolation across the time axis.
     """
     current_frames = len(features)
+
+    if current_frames == 0:
+        feat_cols = features.shape[1] if features.ndim == 2 else FEATURE_DIM
+        return np.zeros((target_frames, feat_cols), dtype=np.float32)
 
     if current_frames == target_frames:
         return features.astype(np.float32)
@@ -144,6 +201,29 @@ def ensure_tables_exist(cursor):
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_dataset_split ON training_dataset(split);")
 
 
+def prune_orphaned_db_rows(cursor):
+    """Removes training_dataset entries whose source video file no longer exists on disk."""
+    rows = cursor.execute("SELECT id, video_path FROM training_dataset").fetchall()
+    missing_ids = [(row_id,) for row_id, vpath in rows if not vpath or not os.path.exists(vpath)]
+    if missing_ids:
+        cursor.executemany("DELETE FROM training_dataset WHERE id = ?", missing_ids)
+        print(f"[INFO] Pruned {len(missing_ids)} orphaned database row(s) whose video files were removed.")
+
+
+def upsert_training_record(cursor, video_path, label, num_frames, feature_path, split_tag):
+    cursor.execute("""
+        INSERT INTO training_dataset
+            (video_path, label, num_frames, extracted_features_path, npy_path, split)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(video_path) DO UPDATE SET
+            label = excluded.label,
+            num_frames = excluded.num_frames,
+            extracted_features_path = excluded.extracted_features_path,
+            npy_path = excluded.npy_path,
+            split = excluded.split;
+    """, (video_path, label, num_frames, feature_path, feature_path, split_tag))
+
+
 def resolve_split_tag(cursor, video_file):
     """Parses <tag> from <sign>_<number>_<tag>.mp4, with safe DB fallback for legacy names."""
     stem_parts = os.path.splitext(video_file)[0].split('_')
@@ -184,14 +264,30 @@ def build_feature_output_path(label_dir, video_file):
 
 
 def is_valid_cached_npy(npy_path):
-    """Verifies an existing .npy file is readable and matches (TARGET_FRAMES, FEATURE_DIM)."""
+    """Verifies an existing .npy file is readable, finite, and matches (TARGET_FRAMES, FEATURE_DIM)."""
     if not os.path.exists(npy_path):
         return False
     try:
         arr = np.load(npy_path)
-        return arr.shape == (TARGET_FRAMES, FEATURE_DIM)
+        return arr.shape == (TARGET_FRAMES, FEATURE_DIM) and bool(np.isfinite(arr).all())
     except (OSError, ValueError):
         return False
+
+
+def save_npy_atomic(output_path, array):
+    """Writes a NumPy array atomically so interrupted runs cannot leave truncated .npy files."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(output_path), suffix='.tmp.npy')
+    os.close(fd)
+    try:
+        np.save(tmp_path, array)
+        os.replace(tmp_path, output_path)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def register_and_process_dataset():
@@ -201,20 +297,15 @@ def register_and_process_dataset():
         return
 
     os.makedirs(FEATURES_DIR, exist_ok=True)
-    mp_holistic = mp.solutions.holistic
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
         ensure_tables_exist(cursor)
+        prune_orphaned_db_rows(cursor)
         conn.commit()
 
-        with mp_holistic.Holistic(
-            static_image_mode=False,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        ) as holistic_extractor:
-
+        with HolisticSession(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic_session:
             for label_dir in sorted(os.listdir(DATASET_DIR)):
                 label_path = os.path.join(DATASET_DIR, label_dir)
                 if not os.path.isdir(label_path) or label_dir.startswith('.'):
@@ -234,19 +325,15 @@ def register_and_process_dataset():
 
                     # If valid 225-dim features already exist, re-sync DB row immediately
                     if is_valid_cached_npy(output_feature_path):
-                        cursor.execute("""
-                            INSERT OR REPLACE INTO training_dataset
-                            (video_path, label, num_frames, extracted_features_path, npy_path, split)
-                            VALUES (?, ?, ?, ?, ?, ?);
-                        """, (video_path, label_dir, TARGET_FRAMES, output_feature_path, output_feature_path, split_tag))
+                        upsert_training_record(cursor, video_path, label_dir, TARGET_FRAMES, output_feature_path, split_tag)
                         conn.commit()
                         print(f"Skipping {video_file} - valid 225-dim features already extracted (DB synced).")
                         continue
 
                     print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
 
-                    holistic_extractor.reset()
-                    raw_features = extract_video_landmarks(video_path, holistic_extractor)
+                    holistic_session.reset_or_recreate()
+                    raw_features = extract_video_landmarks(video_path, holistic_session)
                     if len(raw_features) == 0:
                         print(f"[WARN] No frames extracted from {video_file}. Skipping...")
                         continue
@@ -254,13 +341,8 @@ def register_and_process_dataset():
                     segmented_features = apply_velocity_segmentation(raw_features)
                     fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
 
-                    np.save(output_feature_path, fixed_features)
-
-                    cursor.execute("""
-                        INSERT OR REPLACE INTO training_dataset
-                        (video_path, label, num_frames, extracted_features_path, npy_path, split)
-                        VALUES (?, ?, ?, ?, ?, ?);
-                    """, (video_path, label_dir, len(fixed_features), output_feature_path, output_feature_path, split_tag))
+                    save_npy_atomic(output_feature_path, fixed_features)
+                    upsert_training_record(cursor, video_path, label_dir, len(fixed_features), output_feature_path, split_tag)
                     conn.commit()
     finally:
         conn.close()

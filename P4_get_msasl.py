@@ -5,6 +5,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 from collections import defaultdict
 
 # ==============================================================================
@@ -131,8 +132,9 @@ def get_youtube_id(url):
 
 def get_clip_keys(entry):
     """
-    Returns (primary_key, legacy_key) for a metadata entry so sub-second clips
-    do not collide while preserving compatibility with existing manifests.
+    Returns candidate manifest keys for a metadata entry.
+    Only includes integer-truncated legacy keys when timestamps are exact whole numbers
+    so sub-second clips do not collide with legacy manifest entries.
     """
     url = (entry.get('url') or '').strip()
     start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
@@ -142,11 +144,13 @@ def get_clip_keys(entry):
     yt_id = get_youtube_id(url)
     if yt_id:
         primary = f"{yt_id}_{round(start_time, 3)}_{round(end_time, 3)}_{split_tag}"
-        legacy = f"{yt_id}_{int(start_time)}_{int(end_time)}"
-        return primary, legacy
+        if start_time.is_integer() and end_time.is_integer():
+            legacy = f"{yt_id}_{int(start_time)}_{int(end_time)}"
+            return (primary, legacy)
+        return (primary,)
 
     primary = f"{url}_{round(start_time, 3)}_{round(end_time, 3)}_{split_tag}"
-    return primary, primary
+    return (primary,)
 
 
 def load_download_manifest():
@@ -162,16 +166,25 @@ def load_download_manifest():
 
 
 def save_download_manifest(manifest):
-    """Persists the download manifest to disk."""
+    """Atomically persists the download manifest to disk so interrupted runs never corrupt JSON."""
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
-    with open(MANIFEST_PATH, 'w', encoding='utf-8') as f:
-        json.dump(manifest, f, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=MEDIA_DATASET_DIR, suffix='.manifest.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(manifest, f, indent=2)
+        os.replace(tmp_path, MANIFEST_PATH)
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_6.py).
+    saign_vision.db (populated by P4_ingest_msasl_9.py).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -179,7 +192,7 @@ def load_db_split_tags():
 
     conn = None
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
         cursor = conn.cursor()
         cursor.execute("""
             SELECT clean_text, url, start_time, end_time, split
@@ -350,13 +363,15 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         folder_path = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(folder_path)
 
-        pending_count = 0
+        seen_pending_keys = set()
         for entry in entries:
             clip_keys = get_clip_keys(entry)
+            if clip_keys[0] in seen_pending_keys:
+                continue
             if not is_clip_handled(folder_name, folder_path, clip_keys, manifest):
-                pending_count += 1
+                seen_pending_keys.add(clip_keys[0])
 
-        total_potential = existing_count + pending_count
+        total_potential = existing_count + len(seen_pending_keys)
 
         if total_potential >= min_samples:
             valid_dataset[folder_name] = entries
@@ -383,7 +398,7 @@ def cleanup_partial_files(output_path):
 
 
 def download_clip(url, start_time, end_time, output_path):
-    """Streams and trims YouTube clip with yt-dlp + ffmpeg."""
+    """Streams and trims YouTube clip (capped at 720p for fast landmark extraction) with yt-dlp + ffmpeg."""
     if not url or float(end_time) <= float(start_time):
         return False
 
@@ -397,11 +412,12 @@ def download_clip(url, start_time, end_time, output_path):
         "--quiet",
         "--no-warnings",
         "--no-playlist",
-        "--format", "mp4/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--format", "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "--external-downloader", "ffmpeg",
         "--external-downloader-args", f"ffmpeg_i:-ss {start_time} -to {end_time}",
         "-o", output_path,
+        "--",
         url
     ]
 
@@ -445,10 +461,15 @@ def fetch_msasl_dataset():
         is_priority = norm_name in priority_map
 
         pending = []
+        seen_keys = set()
         for entry in entries:
             clip_keys = get_clip_keys(entry)
+            primary_key = clip_keys[0]
+            if primary_key in seen_keys:
+                continue
             if not is_clip_handled(folder_name, label_dir, clip_keys, manifest):
-                pending.append((entry, clip_keys[0]))
+                seen_keys.add(primary_key)
+                pending.append((entry, primary_key))
 
         if pending:
             classes_with_pending.append({

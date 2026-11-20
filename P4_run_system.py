@@ -24,7 +24,8 @@ EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
 
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
-NO_HAND_RESET_FRAMES = 15  # Reset active sign display after ~0.5s with no hands visible
+VOTE_CLEAR_NO_HAND_FRAMES = 5   # Flush stale vote history after ~0.17s without hands
+NO_HAND_RESET_FRAMES = 15       # Reset active sign HUD after ~0.5s with no hands visible
 
 
 # ==============================================================================
@@ -45,7 +46,7 @@ def load_trained_classes():
             print(f"[WARN] Could not parse {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
     if os.path.exists(DB_PATH):
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30.0)
         try:
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT label FROM training_dataset WHERE label IS NOT NULL ORDER BY label ASC;")
@@ -72,7 +73,7 @@ def load_db_cache():
     if not os.path.exists(DB_PATH):
         return trained_labels, gesture_cache, expression_thresholds
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
 
@@ -135,7 +136,7 @@ def extract_landmarks(results):
 
 def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     """
-    Mirrors P4_extract_features_6.py preprocessing on the live rolling window:
+    Mirrors P4_extract_features_9.py preprocessing on the live rolling window:
     filters static transition frames via L2 velocity and resamples active motion
     to target_frames (30), falling back to the latest 30 raw frames for static signs.
     """
@@ -154,6 +155,10 @@ def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
             features = features[-target_frames:]
 
     current_frames = len(features)
+    if current_frames == 0:
+        feat_cols = features.shape[1] if features.ndim == 2 else EXPECTED_FEATURE_DIM
+        return np.zeros((target_frames, feat_cols), dtype=np.float32)
+
     if current_frames == target_frames:
         return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -330,7 +335,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
     prediction_history = deque(maxlen=DEBOUNCE_WINDOW_SIZE)
 
     current_gesture = "Waiting..."
-    confidence = 0.0
+    display_confidence = 0.0
     no_hand_frames = 0
 
     try:
@@ -340,6 +345,8 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 if not ret or frame is None:
                     print("[WARN] Failed to read frame from webcam. Ending capture session.")
                     break
+                if frame.size == 0:
+                    continue
 
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image.flags.writeable = False
@@ -361,16 +368,18 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 keypoints = extract_landmarks(results)
                 raw_buffer.append(keypoints)
 
+                if no_hand_frames >= VOTE_CLEAR_NO_HAND_FRAMES:
+                    prediction_history.clear()
+
                 if no_hand_frames >= NO_HAND_RESET_FRAMES:
                     current_gesture = "Waiting..."
-                    confidence = 0.0
-                    prediction_history.clear()
+                    display_confidence = 0.0
                 elif len(raw_buffer) >= sequence_length and hands_visible:
                     aligned_seq = prepare_live_sequence(raw_buffer, target_frames=sequence_length)
                     input_tensor = np.expand_dims(aligned_seq, axis=0)
                     res = model(input_tensor, training=False).numpy()[0]
                     prediction_idx = int(np.argmax(res))
-                    confidence = float(res[prediction_idx])
+                    frame_confidence = float(res[prediction_idx])
 
                     raw_label = labels[prediction_idx] if prediction_idx < len(labels) else "UNKNOWN"
 
@@ -379,28 +388,33 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                         'min_score': 0.40
                     })
 
-                    if confidence >= cached_data['min_score']:
+                    if frame_confidence >= cached_data['min_score']:
                         frame_candidate = cached_data['display_name']
                     else:
                         frame_candidate = "Uncertain"
 
-                    prediction_history.append(frame_candidate)
+                    prediction_history.append((frame_candidate, frame_confidence))
 
-                    vote_counts = Counter(prediction_history)
+                    vote_counts = Counter(cand for cand, _ in prediction_history)
                     most_common_gesture, vote_count = vote_counts.most_common(1)[0]
 
                     if vote_count >= DEBOUNCE_CONSENSUS_COUNT:
                         current_gesture = most_common_gesture
+                        matching_scores = [
+                            score for cand, score in prediction_history
+                            if cand == most_common_gesture
+                        ]
+                        display_confidence = float(np.mean(matching_scores)) if matching_scores else frame_confidence
 
                 active_expressions = detect_expressions(results, expression_thresholds)
                 emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
 
-                hud_color = get_confidence_color(confidence)
+                hud_color = get_confidence_color(display_confidence)
 
                 cv2.rectangle(image, (10, 10), (480, 110), (30, 30, 30), -1)
                 cv2.rectangle(image, (10, 10), (480, 110), hud_color, 2)
 
-                cv2.putText(image, f"Sign: {current_gesture} ({confidence*100:.1f}%)",
+                cv2.putText(image, f"Sign: {current_gesture} ({display_confidence*100:.1f}%)",
                             (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, hud_color, 2, cv2.LINE_AA)
                 cv2.putText(image, emotion_text,
                             (20, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1, cv2.LINE_AA)
@@ -423,14 +437,13 @@ def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model file not found at {MODEL_PATH}. "
-            "Please run P4_train_model_6.py to generate the trained model."
+            "Please run P4_train_model_9.py to generate the trained model."
         )
 
     model = load_model(MODEL_PATH)
 
-    input_shape = model.input_shape
-    if isinstance(input_shape, list):
-        input_shape = input_shape[0]
+    input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
+    output_shape = model.output_shape[0] if isinstance(model.output_shape, list) else model.output_shape
 
     seq_len = input_shape[1] or SEQUENCE_LENGTH
     feature_dim = input_shape[2]
@@ -440,7 +453,7 @@ def main():
             f"but Holistic extraction produces {EXPECTED_FEATURE_DIM}. Re-extract features and retrain the model."
         )
 
-    model_num_classes = model.output_shape[-1]
+    model_num_classes = output_shape[-1]
 
     while True:
         trained_labels, gesture_cache, expression_thresholds = load_db_cache()
