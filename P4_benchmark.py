@@ -4,7 +4,10 @@ import sqlite3
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from keras.models import load_model
+try:
+    from keras.models import load_model
+except ImportError:  # TensorFlow-bundled Keras fallback
+    from tensorflow.keras.models import load_model
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # ==============================================================================
@@ -32,7 +35,7 @@ def load_all_labels():
             print(f"[WARN] Failed to read {CLASSES_PATH} ({e}). Falling back to SQLite...")
 
     if not os.path.exists(DB_PATH):
-        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run P4_train_model_9.py first.")
+        raise FileNotFoundError(f"Neither {CLASSES_PATH} nor {DB_PATH} found. Run your training script first.")
 
     conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
@@ -54,8 +57,8 @@ def load_benchmark_data(split_name):
     try:
         cursor = conn.cursor()
         return cursor.execute(
-            "SELECT npy_path, label FROM training_dataset WHERE split = ? AND npy_path IS NOT NULL AND label IS NOT NULL",
-            (split_name,)
+            "SELECT npy_path, label FROM training_dataset WHERE LOWER(split) = ? AND npy_path IS NOT NULL AND label IS NOT NULL",
+            (split_name.lower(),)
         ).fetchall()
     finally:
         conn.close()
@@ -67,7 +70,8 @@ def resolve_npy_path(npy_path):
         return None
     if os.path.exists(npy_path):
         return npy_path
-    portable_path = os.path.join(FEATURES_DIR, os.path.basename(npy_path))
+    # Normalise Windows-style separators so paths saved on another OS still resolve
+    portable_path = os.path.join(FEATURES_DIR, os.path.basename(npy_path.replace('\\', '/')))
     return portable_path if os.path.exists(portable_path) else None
 
 
@@ -89,7 +93,7 @@ def prepare_tensors(data_list, expected_shape, class_to_idx):
 
         try:
             features = np.load(npy_path)
-        except (OSError, ValueError) as e:
+        except Exception as e:  # EOFError / UnpicklingError etc. from truncated files
             print(f"[WARN] Failed to load corrupted feature file '{npy_path}': {e}. Skipping...")
             skipped += 1
             continue
@@ -153,10 +157,10 @@ def run_benchmark():
     cm_output_path = os.path.join(SCRIPT_DIR, output_filename)
 
     if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run P4_train_model_9.py first.")
+        raise FileNotFoundError(f"Trained model not found at {MODEL_PATH}. Run your training script first.")
 
     print("Loading AI model into memory...")
-    model = load_model(MODEL_PATH)
+    model = load_model(MODEL_PATH, compile=False)  # inference only; avoids optimizer/loss deserialization issues
     input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
     output_shape = model.output_shape[0] if isinstance(model.output_shape, list) else model.output_shape
     expected_input_shape = (input_shape[1] or 30, input_shape[2] or 225)
@@ -165,7 +169,7 @@ def run_benchmark():
     print("Synchronizing class mappings...")
     class_names = load_all_labels()
     if not class_names:
-        print("[ERROR] No class labels found. Run P4_train_model_9.py first.")
+        print("[ERROR] No class labels found. Run your training script first.")
         return
 
     class_to_idx = {name: idx for idx, name in enumerate(class_names)}
@@ -174,7 +178,7 @@ def run_benchmark():
     if len(class_names) != model_num_classes:
         raise ValueError(
             f"Class count mismatch: model outputs {model_num_classes} classes, "
-            f"but loaded class mapping has {len(class_names)} classes. Retrain with P4_train_model_9.py."
+            f"but loaded class mapping has {len(class_names)} classes. Retrain the model."
         )
 
     print(f"Loading '{target_split}' dataset...")
@@ -228,7 +232,9 @@ def run_benchmark():
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
 
-    plt.savefig(cm_output_path, dpi=300)
+    # Very large class counts at 300 DPI can need hundreds of MB of RAM; scale DPI down for big figures
+    save_dpi = 300 if fig_dim <= 16 else 150 if fig_dim <= 24 else 100
+    plt.savefig(cm_output_path, dpi=save_dpi)
     print(f"Confusion matrix heat map saved successfully to: {cm_output_path}")
 
     try:
