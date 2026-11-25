@@ -1,4 +1,5 @@
 import json
+import operator
 import os
 import sqlite3
 from collections import deque, Counter
@@ -24,6 +25,7 @@ RAW_CAPTURE_WINDOW = 45  # ~1.5s rolling capture buffer before velocity segmenta
 VELOCITY_THRESHOLD = 0.015
 MIN_ACTIVE_FRAMES = 10
 EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
+EXPRESSION_SEED_VERSION = 2  # Must match P4_setup_db.py. v2 = face-size-normalised ratio thresholds.
 
 DEBOUNCE_WINDOW_SIZE = 8
 DEBOUNCE_CONSENSUS_COUNT = 5
@@ -111,6 +113,18 @@ def load_db_cache():
                 }
         except sqlite3.OperationalError:
             pass
+
+        # Thresholds seeded by older P4_setup_db.py versions use raw image-fraction units that
+        # are incompatible with the ratio-based metrics below, so don't apply them.
+        try:
+            row = cursor.execute("SELECT value FROM app_meta WHERE key = 'expression_seed_version';").fetchone()
+            seed_version = int(row[0]) if row and str(row[0]).strip().isdigit() else 0
+        except sqlite3.OperationalError:
+            seed_version = 0
+        if expression_thresholds and seed_version < EXPRESSION_SEED_VERSION:
+            print("[WARN] expression_thresholds in the database use the old unit system. "
+                  "Re-run P4_setup_db.py to install the updated values; expression detection is disabled until then.")
+            expression_thresholds = {}
     finally:
         conn.close()
 
@@ -184,7 +198,24 @@ def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     return np.nan_to_num(interpolator(x_new).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def detect_expressions(results, thresholds):
+def detect_expressions(results, thresholds, image_size=None):
+    """
+    Geometric facial-expression detection from the 468-point face mesh.
+
+    Every metric is expressed as a RATIO of the face's own size (S = distance between the outer
+    eye corners, landmarks 33 and 263), measured in PIXELS (image_size = (width, height)). That makes
+    thresholds independent of camera distance and frame aspect ratio. Metric definitions
+    (thresholds in the DB's expression_thresholds table are in these units):
+
+      browSquint / browLowerer : |lm70.y  - lm159.y| / S     brow-to-eyelid gap          (smaller = lowered)
+      browInnerUp              : |lm55.y  - lm6.y|   / S     inner brow-to-nose bridge   (larger  = raised)
+      eyeWide* / eyeSquint*    : |lid_top.y - lid_bottom.y| / S  (159/145 and 386/374)   (larger = wider)
+      mouthSmile*              : (lm13.y - corner.y) / S     corner LIFT above upper-lip centre (corners 61 / 291)
+      mouthFrown*              : (corner.y - lm13.y) / S     corner DROP below upper-lip centre
+      jawOpen                  : |lm14.y - lm13.y|   / S     inner-lip gap
+      mouthPucker              : |lm291.x - lm61.x|  / S     mouth width                 (smaller = puckered)
+      noseSneer*               : |lm197.y - lm0.y|   / S     nose bridge-to-upper-lip    (smaller = sneer)
+    """
     active_emotions = []
     if not results.face_landmarks or not thresholds:
         return active_emotions
@@ -193,93 +224,81 @@ def detect_expressions(results, thresholds):
     if len(landmarks) < 468:
         return active_emotions
 
-    # Brow furrow / squint (check stricter threshold 0.020 before 0.025)
+    width, height = image_size if image_size else (1.0, 1.0)
+
+    def px(i):
+        return landmarks[i].x * width, landmarks[i].y * height
+
+    (lx, ly), (rx, ry) = px(33), px(263)
+    scale = float(np.hypot(rx - lx, ry - ly))
+    if not np.isfinite(scale) or scale < 1e-6:
+        return active_emotions
+
+    def vdist(a, b):
+        return abs(px(a)[1] - px(b)[1]) / scale
+
+    def vdiff(a, b):  # signed: (a.y - b.y) / S   (image y grows downward)
+        return (px(a)[1] - px(b)[1]) / scale
+
+    def hdist(a, b):
+        return abs(px(a)[0] - px(b)[0]) / scale
+
+    def add(label):
+        if label not in active_emotions:
+            active_emotions.append(label)
+
+    def pair_check(left_key, right_key, left_val, right_val, op, default_label):
+        hit = any(
+            key in thresholds and op(val, thresholds[key]['threshold'])
+            for key, val in ((left_key, left_val), (right_key, right_val))
+        )
+        if hit:
+            source = thresholds.get(left_key) or thresholds.get(right_key) or {}
+            add(source.get('display_name', default_label))
+
+    # Brow furrow / squint (stricter 'browSquint' checked before 'browLowerer')
     if 'browLowerer' in thresholds or 'browSquint' in thresholds:
-        brow_dist = abs(landmarks[70].y - landmarks[159].y)
-        if 'browSquint' in thresholds and brow_dist < thresholds['browSquint']['threshold']:
-            active_emotions.append(thresholds['browSquint']['display_name'])
-        elif 'browLowerer' in thresholds and brow_dist < thresholds['browLowerer']['threshold']:
-            active_emotions.append(thresholds['browLowerer']['display_name'])
+        brow_gap = vdist(70, 159)
+        if 'browSquint' in thresholds and brow_gap < thresholds['browSquint']['threshold']:
+            add(thresholds['browSquint']['display_name'])
+        elif 'browLowerer' in thresholds and brow_gap < thresholds['browLowerer']['threshold']:
+            add(thresholds['browLowerer']['display_name'])
 
     # Inner brow raise
-    if 'browInnerUp' in thresholds:
-        inner_brow = abs(landmarks[55].y - landmarks[6].y)
-        if inner_brow > thresholds['browInnerUp']['threshold']:
-            active_emotions.append(thresholds['browInnerUp']['display_name'])
+    if 'browInnerUp' in thresholds and vdist(55, 6) > thresholds['browInnerUp']['threshold']:
+        add(thresholds['browInnerUp']['display_name'])
 
     # Eye aperture (shared between eyeWide and eyeSquint)
-    left_eye_open = abs(landmarks[159].y - landmarks[145].y)
-    right_eye_open = abs(landmarks[386].y - landmarks[374].y)
+    left_eye_open = vdist(159, 145)
+    right_eye_open = vdist(386, 374)
+    pair_check('eyeWideLeft', 'eyeWideRight', left_eye_open, right_eye_open, operator.gt, 'Fearful / Startled')
+    pair_check('eyeSquintLeft', 'eyeSquintRight', left_eye_open, right_eye_open, operator.lt, 'Suspicious / Wincing')
 
-    if 'eyeWideLeft' in thresholds or 'eyeWideRight' in thresholds:
-        left_wide = 'eyeWideLeft' in thresholds and left_eye_open > thresholds['eyeWideLeft']['threshold']
-        right_wide = 'eyeWideRight' in thresholds and right_eye_open > thresholds['eyeWideRight']['threshold']
-        if left_wide or right_wide:
-            display_label = thresholds.get('eyeWideLeft', thresholds.get('eyeWideRight', {})).get('display_name', 'Fearful / Startled')
-            if display_label not in active_emotions:
-                active_emotions.append(display_label)
-
-    if 'eyeSquintLeft' in thresholds or 'eyeSquintRight' in thresholds:
-        left_squint = 'eyeSquintLeft' in thresholds and left_eye_open < thresholds['eyeSquintLeft']['threshold']
-        right_squint = 'eyeSquintRight' in thresholds and right_eye_open < thresholds['eyeSquintRight']['threshold']
-        if left_squint or right_squint:
-            display_label = thresholds.get('eyeSquintLeft', thresholds.get('eyeSquintRight', {})).get('display_name', 'Suspicious / Wincing')
-            if display_label not in active_emotions:
-                active_emotions.append(display_label)
-
-    # Smile
+    # Smile (corners lifted above the upper-lip centre) / Frown (corners dropped below it)
     if 'mouthSmileLeft' in thresholds or 'mouthSmileRight' in thresholds:
-        left_smile = abs(landmarks[61].x - landmarks[13].x)
-        right_smile = abs(landmarks[291].x - landmarks[13].x)
+        pair_check('mouthSmileLeft', 'mouthSmileRight',
+                   vdiff(13, 61), vdiff(13, 291), operator.gt, 'Happy')
 
-        left_active = 'mouthSmileLeft' in thresholds and left_smile > thresholds['mouthSmileLeft']['threshold']
-        right_active = 'mouthSmileRight' in thresholds and right_smile > thresholds['mouthSmileRight']['threshold']
-
-        if left_active or right_active:
-            display_label = thresholds.get('mouthSmileLeft', thresholds.get('mouthSmileRight', {})).get('display_name', 'Happy')
-            if display_label not in active_emotions:
-                active_emotions.append(display_label)
-
-    # Frown
     if 'mouthFrownLeft' in thresholds or 'mouthFrownRight' in thresholds:
-        left_frown = landmarks[61].y - landmarks[17].y
-        right_frown = landmarks[291].y - landmarks[17].y
-
-        left_frown_active = 'mouthFrownLeft' in thresholds and left_frown > thresholds['mouthFrownLeft']['threshold']
-        right_frown_active = 'mouthFrownRight' in thresholds and right_frown > thresholds['mouthFrownRight']['threshold']
-
-        if left_frown_active or right_frown_active:
-            display_label = thresholds.get('mouthFrownLeft', thresholds.get('mouthFrownRight', {})).get('display_name', 'Sad / Concerned')
-            if display_label not in active_emotions:
-                active_emotions.append(display_label)
+        pair_check('mouthFrownLeft', 'mouthFrownRight',
+                   vdiff(61, 13), vdiff(291, 13), operator.gt, 'Sad / Concerned')
 
     # Jaw drop / open mouth
-    if 'jawOpen' in thresholds:
-        mouth_open = abs(landmarks[14].y - landmarks[13].y)
-        if mouth_open > thresholds['jawOpen']['threshold']:
-            active_emotions.append(thresholds['jawOpen']['display_name'])
+    if 'jawOpen' in thresholds and vdist(14, 13) > thresholds['jawOpen']['threshold']:
+        add(thresholds['jawOpen']['display_name'])
 
     # Mouth pucker / horizontal narrowing
-    if 'mouthPucker' in thresholds:
-        mouth_width = abs(landmarks[291].x - landmarks[61].x)
-        if mouth_width < thresholds['mouthPucker']['threshold']:
-            active_emotions.append(thresholds['mouthPucker']['display_name'])
+    if 'mouthPucker' in thresholds and hdist(291, 61) < thresholds['mouthPucker']['threshold']:
+        add(thresholds['mouthPucker']['display_name'])
 
     # Nose sneer
     if 'noseSneerLeft' in thresholds or 'noseSneerRight' in thresholds:
-        nose_dist = abs(landmarks[197].y - landmarks[0].y)
-
-        left_sneer_active = 'noseSneerLeft' in thresholds and nose_dist < thresholds['noseSneerLeft']['threshold']
-        right_sneer_active = 'noseSneerRight' in thresholds and nose_dist < thresholds['noseSneerRight']['threshold']
-
-        if left_sneer_active or right_sneer_active:
-            display_label = thresholds.get('noseSneerLeft', thresholds.get('noseSneerRight', {})).get('display_name', 'Disgust')
-            if display_label not in active_emotions:
-                active_emotions.append(display_label)
+        nose_dist = vdist(197, 0)
+        pair_check('noseSneerLeft', 'noseSneerRight', nose_dist, nose_dist, operator.lt, 'Disgust')
 
     # Neutral fallback
     if not active_emotions and 'faceNeutral' in thresholds:
-        active_emotions.append(thresholds['faceNeutral']['display_name'])
+        add(thresholds['faceNeutral']['display_name'])
 
     return active_emotions
 
@@ -437,7 +456,10 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                         ]
                         display_confidence = float(np.mean(matching_scores)) if matching_scores else frame_confidence
 
-                active_expressions = detect_expressions(results, expression_thresholds)
+                active_expressions = detect_expressions(
+                    results, expression_thresholds,
+                    image_size=(image.shape[1], image.shape[0])
+                )
                 emotion_text = f"Emotion: {', '.join(active_expressions)}" if active_expressions else "Emotion: Neutral"
 
                 hud_color = get_confidence_color(display_confidence)
