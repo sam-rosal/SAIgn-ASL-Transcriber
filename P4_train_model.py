@@ -5,16 +5,10 @@ import sys
 import numpy as np
 
 # --- Model Training & Preprocessing Imports ---
-try:
-    from keras.models import Model
-    from keras.layers import Input, LSTM, Dense, Dropout, Attention, GlobalAveragePooling1D
-    from keras.callbacks import EarlyStopping
-    from keras.utils import to_categorical
-except ImportError:  # TensorFlow-bundled Keras fallback
-    from tensorflow.keras.models import Model
-    from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Attention, GlobalAveragePooling1D
-    from tensorflow.keras.callbacks import EarlyStopping
-    from tensorflow.keras.utils import to_categorical
+from keras.models import Model
+from keras.layers import Input, LSTM, Dense, Dropout, Attention, GlobalAveragePooling1D
+from keras.callbacks import EarlyStopping
+from keras.utils import to_categorical
 from sklearn.preprocessing import LabelEncoder
 
 # --- System & Path Configurations ---
@@ -22,7 +16,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:  # make the sibling P4_extract_features.py importable from any working dir
     sys.path.insert(0, SCRIPT_DIR)
 
-# Feature extraction/caching lives in ONE place: P4_extract_features.py (no duplicated copy here).
+# Feature extraction/caching lives in ONE place: P4_extract_features.py
 from P4_extract_features import (  # noqa: E402
     register_and_process_dataset,
     DB_PATH,

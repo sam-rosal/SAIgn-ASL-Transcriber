@@ -5,10 +5,7 @@ import sqlite3
 from collections import deque, Counter
 import cv2
 import numpy as np
-try:
-    from keras.models import load_model
-except ImportError:  # TensorFlow-bundled Keras fallback
-    from tensorflow.keras.models import load_model
+from keras.models import load_model
 import mediapipe as mp
 from scipy.interpolate import interp1d
 

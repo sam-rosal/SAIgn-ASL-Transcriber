@@ -4,10 +4,7 @@ import sqlite3
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-try:
-    from keras.models import load_model
-except ImportError:  # TensorFlow-bundled Keras fallback
-    from tensorflow.keras.models import load_model
+from keras.models import load_model
 from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # ==============================================================================
