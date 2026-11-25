@@ -4,7 +4,10 @@ import sqlite3
 from collections import deque, Counter
 import cv2
 import numpy as np
-from keras.models import load_model
+try:
+    from keras.models import load_model
+except ImportError:  # TensorFlow-bundled Keras fallback
+    from tensorflow.keras.models import load_model
 import mediapipe as mp
 from scipy.interpolate import interp1d
 
@@ -82,9 +85,13 @@ def load_db_cache():
             for raw_label, display_name, min_score in cursor.fetchall():
                 if not raw_label:
                     continue
+                try:
+                    parsed_min_score = float(min_score) if min_score is not None else 0.40
+                except (TypeError, ValueError):
+                    parsed_min_score = 0.40
                 gesture_cache[raw_label] = {
                     'display_name': display_name or raw_label.replace('_', ' ').title(),
-                    'min_score': float(min_score) if min_score is not None else 0.40
+                    'min_score': parsed_min_score
                 }
         except sqlite3.OperationalError:
             pass
@@ -94,9 +101,13 @@ def load_db_cache():
             for blendshape, display_name, threshold in cursor.fetchall():
                 if not blendshape or threshold is None:
                     continue
+                try:
+                    parsed_threshold = float(threshold)
+                except (TypeError, ValueError):
+                    continue
                 expression_thresholds[blendshape] = {
                     'display_name': display_name or blendshape,
-                    'threshold': float(threshold)
+                    'threshold': parsed_threshold
                 }
         except sqlite3.OperationalError:
             pass
@@ -111,9 +122,10 @@ def load_db_cache():
 
 def get_confidence_color(score):
     score = max(0.0, min(1.0, float(score)))
-    b = int((1.0 - score) * 255)
-    r = int(score * 255)
-    g = 0
+    # BGR: low confidence = red, high confidence = green
+    b = 0
+    g = int(score * 255)
+    r = int((1.0 - score) * 255)
     return (b, g, r)
 
 
@@ -136,7 +148,7 @@ def extract_landmarks(results):
 
 def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     """
-    Mirrors P4_extract_features_9.py preprocessing on the live rolling window:
+    Mirrors P4_extract_features.py preprocessing on the live rolling window:
     filters static transition frames via L2 velocity and resamples active motion
     to target_frames (30), falling back to the latest 30 raw frames for static signs.
     """
@@ -321,6 +333,11 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
     window_name = 'SAIgn - Live Recognition Engine'
     labels = trained_labels if trained_labels else ['UNKNOWN']
 
+    if not hasattr(mp, 'solutions'):
+        raise ImportError(
+            "This MediaPipe build does not expose the legacy 'mp.solutions' API. "
+            "Install a version that does, e.g.: pip install mediapipe==0.10.14"
+        )
     mp_holistic = mp.solutions.holistic
     mp_drawing = mp.solutions.drawing_utils
 
@@ -337,6 +354,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
     current_gesture = "Waiting..."
     display_confidence = 0.0
     no_hand_frames = 0
+    consecutive_errors = 0
 
     try:
         with mp_holistic.Holistic(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic:
@@ -350,7 +368,20 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
 
                 image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image.flags.writeable = False
-                results = holistic.process(image)
+                try:
+                    results = holistic.process(image)
+                    consecutive_errors = 0
+                except Exception as e:
+                    consecutive_errors += 1
+                    print(f"[WARN] MediaPipe processing error ({consecutive_errors}/5): {e}")
+                    if consecutive_errors >= 5:
+                        print("[ERROR] Too many consecutive MediaPipe errors. Ending capture session.")
+                        break
+                    try:
+                        holistic.reset()
+                    except Exception:
+                        pass
+                    continue
 
                 image.flags.writeable = True
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
@@ -377,7 +408,7 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                 elif len(raw_buffer) >= sequence_length and hands_visible:
                     aligned_seq = prepare_live_sequence(raw_buffer, target_frames=sequence_length)
                     input_tensor = np.expand_dims(aligned_seq, axis=0)
-                    res = model(input_tensor, training=False).numpy()[0]
+                    res = np.asarray(model(input_tensor, training=False))[0]
                     prediction_idx = int(np.argmax(res))
                     frame_confidence = float(res[prediction_idx])
 
@@ -437,10 +468,10 @@ def main():
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
             f"Model file not found at {MODEL_PATH}. "
-            "Please run P4_train_model_9.py to generate the trained model."
+            "Please run your training script to generate the trained model."
         )
 
-    model = load_model(MODEL_PATH)
+    model = load_model(MODEL_PATH, compile=False)  # inference only; avoids optimizer/loss deserialization issues
 
     input_shape = model.input_shape[0] if isinstance(model.input_shape, list) else model.input_shape
     output_shape = model.output_shape[0] if isinstance(model.output_shape, list) else model.output_shape
@@ -469,7 +500,11 @@ def main():
             print("Exiting SAIgn Engine cleanly. Goodbye!")
             break
         elif action == 'START':
-            run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, seq_len)
+            try:
+                run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, seq_len)
+            except RuntimeError as e:
+                # e.g. webcam unavailable: report and return to the menu instead of crashing
+                print(f"[ERROR] {e}")
 
 
 if __name__ == "__main__":
