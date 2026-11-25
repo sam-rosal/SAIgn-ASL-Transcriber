@@ -23,25 +23,26 @@ class HolisticSession:
     """Manages MediaPipe Holistic lifecycle with automatic recovery if a video corrupts the graph."""
 
     def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
-        if not hasattr(mp, 'solutions'):
-            raise ImportError(
-                "This MediaPipe build does not expose the legacy 'mp.solutions' API. "
-                "Install a version that does, e.g.: pip install mediapipe==0.10.14"
-            )
-        self._mp_holistic = mp.solutions.holistic
+        # Nothing MediaPipe-related is touched here: the graph is created lazily, only when a video
+        # actually needs extraction. Callers that only use already-extracted features (e.g. the training
+        # script) then work even if this MediaPipe build has no legacy 'mp.solutions' API.
         self._det_conf = min_detection_confidence
         self._trk_conf = min_tracking_confidence
         self._extractor = None
 
     def _create(self):
-        return self._mp_holistic.Holistic(
+        if not hasattr(mp, 'solutions'):
+            raise ImportError(
+                "This MediaPipe build does not expose the legacy 'mp.solutions' API, so new videos cannot "
+                "be processed. Install a version that does, e.g.: pip install mediapipe==0.10.14"
+            )
+        return mp.solutions.holistic.Holistic(
             static_image_mode=False,
             min_detection_confidence=self._det_conf,
             min_tracking_confidence=self._trk_conf
         )
 
     def __enter__(self):
-        self._extractor = self._create()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -300,7 +301,14 @@ def save_npy_atomic(output_path, array):
                 pass
 
 
-def register_and_process_dataset():
+def register_and_process_dataset(verbose_skips=True):
+    """
+    Extracts/caches 30x225 landmark features for every video in media_dataset/ and syncs the
+    training_dataset table. Already-extracted videos are only re-synced to the database.
+
+    verbose_skips: print a line for every already-extracted / untagged video (set False when called
+    from the training script to keep its output readable on large datasets).
+    """
     if not os.path.exists(DATASET_DIR):
         os.makedirs(DATASET_DIR, exist_ok=True)
         print(f"[WARN] Created empty dataset directory at {DATASET_DIR}. Add sign folders and videos before running extraction.")
@@ -314,6 +322,10 @@ def register_and_process_dataset():
         ensure_tables_exist(cursor)
         prune_orphaned_db_rows(cursor)
         conn.commit()
+
+        extraction_available = True
+        no_split_count = 0
+        unextracted_count = 0
 
         with HolisticSession(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic_session:
             for label_dir in sorted(os.listdir(DATASET_DIR)):
@@ -330,19 +342,32 @@ def register_and_process_dataset():
 
                     split_tag = resolve_split_tag(cursor, video_file)
                     if not split_tag:
-                        print(f"[WARN] No matching split metadata for: {video_file}. Skipping processing...")
+                        no_split_count += 1
+                        if verbose_skips:
+                            print(f"[WARN] No matching split metadata for: {video_file}. Skipping processing...")
                         continue
 
                     # If valid 225-dim features already exist, re-sync DB row immediately
                     if is_valid_cached_npy(output_feature_path):
                         upsert_training_record(cursor, video_path, label_dir, TARGET_FRAMES, output_feature_path, split_tag)
                         conn.commit()
-                        print(f"Skipping {video_file} - valid 225-dim features already extracted (DB synced).")
+                        if verbose_skips:
+                            print(f"Skipping {video_file} - valid 225-dim features already extracted (DB synced).")
+                        continue
+
+                    if not extraction_available:
+                        unextracted_count += 1
+                        continue
+                    try:
+                        holistic_session.reset_or_recreate()
+                    except ImportError as e:
+                        print(f"[ERROR] {e}")
+                        print("[WARN] Feature extraction is unavailable; continuing with already-extracted features only.")
+                        extraction_available = False
+                        unextracted_count += 1
                         continue
 
                     print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
-
-                    holistic_session.reset_or_recreate()
                     raw_features = extract_video_landmarks(video_path, holistic_session)
                     if len(raw_features) == 0:
                         print(f"[WARN] No frames extracted from {video_file}. Skipping...")
@@ -354,6 +379,11 @@ def register_and_process_dataset():
                     save_npy_atomic(output_feature_path, fixed_features)
                     upsert_training_record(cursor, video_path, label_dir, len(fixed_features), output_feature_path, split_tag)
                     conn.commit()
+
+        if no_split_count and not verbose_skips:
+            print(f"[WARN] {no_split_count} video(s) skipped: no train/val/test tag in the filename or video_clips table.")
+        if unextracted_count:
+            print(f"[WARN] {unextracted_count} video(s) were NOT extracted and will be missing from training.")
     finally:
         conn.close()
 
