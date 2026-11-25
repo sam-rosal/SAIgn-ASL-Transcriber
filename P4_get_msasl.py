@@ -1,10 +1,11 @@
 import glob
-import os
 import json
+import os
 import re
 import shutil
 import sqlite3
 import subprocess
+import sys
 import tempfile
 from collections import defaultdict
 
@@ -26,13 +27,31 @@ JSON_FILES = [
 MIN_VIDEOS_PER_CLASS = 3
 BATCH_SIZE_CLASSES = 10  # Process 10 sign classes per execution run
 VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
+DOWNLOAD_TIMEOUT_SEC = 120
+
+# Manifest status values (per clip): "<filename>" = downloaded, FAILED_MARKER = permanently
+# unavailable, "__RETRY__:<n>" = n transient failures so far (timeouts, flaky network, ...).
 FAILED_MARKER = "__FAILED__"
+RETRY_PREFIX = "__RETRY__:"
+MAX_TRANSIENT_ATTEMPTS = 3
 
 # Set to True to download ONLY signs listed in priority_signs.txt and ignore the rest of MS-ASL
 ONLY_DOWNLOAD_PRIORITY = False
 
 # Set to True to re-attempt previously failed/unavailable YouTube clips
 RETRY_FAILED = False
+
+# yt-dlp error text that means the clip is gone for good (never worth retrying)
+PERMANENT_ERROR_MARKERS = (
+    "video unavailable", "this video is unavailable", "this video is not available",
+    "private video", "has been removed", "no longer available", "has been terminated",
+    "copyright", "members-only", "join this channel", "confirm your age",
+    "is not a valid url", "unsupported url", "incomplete youtube id",
+)
+# yt-dlp error text meaning YouTube is throttling/blocking us: stop instead of poisoning the manifest
+BLOCKED_ERROR_MARKERS = ("not a bot", "http error 429", "too many requests")
+
+DL_OK, DL_PERMANENT, DL_TRANSIENT, DL_BLOCKED = "ok", "permanent", "transient", "blocked"
 
 # Used strictly to auto-create priority_signs.txt on first run if the file does not exist
 DEFAULT_PRIORITY_VOCAB = {
@@ -65,14 +84,17 @@ DEFAULT_PRIORITY_VOCAB = {
 }
 
 
+# ==============================================================================
+# SMALL UTILITIES
+# ==============================================================================
 def sanitize_label(text):
     """Normalizes sign text into a safe snake_case folder/file identifier."""
     cleaned = (text or "").strip().lower().replace(" ", "_")
-    return re.sub(r'[\\/:*?"<>|]+', '_', cleaned)
+    return re.sub(r'[\\/:*?"<>|%]+', '_', cleaned)
 
 
 def parse_timestamp(value, default=0.0):
-    """Safely converts a metadata timestamp to float."""
+    """Safely converts a metadata timestamp to float. None -> default; unparseable -> None."""
     if value is None:
         return default
     try:
@@ -132,9 +154,10 @@ def get_youtube_id(url):
 
 def get_clip_keys(entry):
     """
-    Returns candidate manifest keys for a metadata entry.
-    Only includes integer-truncated legacy keys when timestamps are exact whole numbers
-    so sub-second clips do not collide with legacy manifest entries.
+    Returns candidate manifest keys for a metadata entry, most-specific first (index 0 is the
+    "primary" key new records are written under). Includes a legacy integer-truncated key
+    (the format used before split-aware, sub-second-precise keys existed) so manifests built
+    by older versions of this script are still recognized and not re-downloaded.
     """
     url = (entry.get('url') or '').strip()
     start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
@@ -153,20 +176,31 @@ def get_clip_keys(entry):
     return (primary,)
 
 
+# ==============================================================================
+# MANIFEST (crash-safe)
+# ==============================================================================
 def load_download_manifest():
-    """Loads the record of already-attempted clip keys mapped to their local filenames or failure status."""
-    if os.path.exists(MANIFEST_PATH):
+    """Loads clip_key -> status records. A corrupt manifest is preserved aside, never silently discarded."""
+    if not os.path.exists(MANIFEST_PATH):
+        return {}
+    try:
+        with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+        raise ValueError("manifest root is not an object")
+    except (json.JSONDecodeError, ValueError, OSError) as exc:
+        backup = MANIFEST_PATH + '.corrupt'
         try:
-            with open(MANIFEST_PATH, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                return data if isinstance(data, dict) else {}
-        except (json.JSONDecodeError, OSError):
-            return {}
-    return {}
+            os.replace(MANIFEST_PATH, backup)
+            print(f"[WARN] Download manifest was unreadable ({exc}); moved to {backup}. Starting a fresh manifest.")
+        except OSError:
+            print(f"[WARN] Download manifest was unreadable ({exc}). Starting a fresh manifest.")
+        return {}
 
 
 def save_download_manifest(manifest):
-    """Atomically persists the download manifest to disk so interrupted runs never corrupt JSON."""
+    """Atomically persists the manifest (temp file + os.replace) so an interruption can't corrupt it."""
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=MEDIA_DATASET_DIR, suffix='.manifest.tmp')
     try:
@@ -181,10 +215,55 @@ def save_download_manifest(manifest):
                 pass
 
 
+def transient_attempts(status):
+    """Number of transient failures recorded in a '__RETRY__:<n>' status (0 for anything else)."""
+    if isinstance(status, str) and status.startswith(RETRY_PREFIX):
+        try:
+            return int(status[len(RETRY_PREFIX):])
+        except ValueError:
+            return MAX_TRANSIENT_ATTEMPTS
+    return 0
+
+
+def is_clip_handled(folder_name, folder_path, clip_keys, manifest, retry_failed=RETRY_FAILED):
+    """
+    True if NONE of a clip's candidate keys need another download attempt: the clip is on disk,
+    permanently unavailable, or has exhausted its transient-retry budget. Checking every
+    candidate key keeps old (legacy-format) manifest records recognized across upgrades.
+    """
+    folder_manifest = manifest.get(folder_name)
+    if not isinstance(folder_manifest, dict):
+        return False
+
+    for key in clip_keys:
+        status = folder_manifest.get(key)
+        if not status or not isinstance(status, str):
+            continue
+
+        if status == FAILED_MARKER:
+            if not retry_failed:
+                return True
+            continue
+
+        if status.startswith(RETRY_PREFIX):
+            if (not retry_failed) and transient_attempts(status) >= MAX_TRANSIENT_ATTEMPTS:
+                return True
+            continue
+
+        full_path = os.path.join(folder_path, status)
+        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+            return True
+
+    return False
+
+
+# ==============================================================================
+# LOCAL DATASET HELPERS
+# ==============================================================================
 def load_db_split_tags():
     """
     Loads (clean_text, url, start_time, end_time) -> split tag mappings from
-    saign_vision.db (populated by P4_ingest_msasl_9.py).
+    saign_vision.db (populated by the MS-ASL ingest script).
     """
     tag_lookup = {}
     if not os.path.exists(DB_PATH):
@@ -208,7 +287,7 @@ def load_db_split_tags():
             key = (norm_text, (url or '').strip(), round(st, 3), round(et, 3))
             tag_lookup[key] = (split or 'train').strip().lower()
     except sqlite3.Error:
-        pass
+        pass  # table not created yet: fall back to the split implied by each JSON filename
     finally:
         if conn:
             conn.close()
@@ -223,8 +302,7 @@ def get_existing_folders():
         for folder in os.listdir(MEDIA_DATASET_DIR):
             folder_path = os.path.join(MEDIA_DATASET_DIR, folder)
             if os.path.isdir(folder_path) and not folder.startswith('.'):
-                normalized_key = sanitize_label(folder)
-                folder_map[normalized_key] = folder
+                folder_map[sanitize_label(folder)] = folder
     return folder_map
 
 
@@ -263,32 +341,9 @@ def get_next_video_number(folder_path, sign_name):
     return max(max_num, total_videos) + 1
 
 
-def is_clip_handled(folder_name, folder_path, clip_keys, manifest, retry_failed=RETRY_FAILED):
-    """
-    Checks if a clip is already downloaded on disk or marked as permanently failed
-    so dead YouTube links do not stall the download queue forever.
-    """
-    folder_manifest = manifest.get(folder_name)
-    if not isinstance(folder_manifest, dict):
-        return False
-
-    for key in clip_keys:
-        entry_status = folder_manifest.get(key)
-        if not entry_status:
-            continue
-
-        if entry_status == FAILED_MARKER:
-            if not retry_failed:
-                return True
-            continue
-
-        full_path = os.path.join(folder_path, entry_status)
-        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
-            return True
-
-    return False
-
-
+# ==============================================================================
+# METADATA LOADING & FILTERING
+# ==============================================================================
 def load_and_filter_metadata(priority_map, min_samples=3):
     """Parses MS-ASL JSON files, resolves split tags, and filters classes by min sample count."""
     existing_folders = get_existing_folders()
@@ -315,8 +370,8 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
-            print(f"[WARN] Failed to parse {json_path}: {e}. Skipping...")
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] Failed to parse {json_path}: {exc}. Skipping...")
             continue
 
         if not isinstance(data, list):
@@ -340,12 +395,7 @@ def load_and_filter_metadata(priority_map, min_samples=3):
             if start_time is None or end_time is None or end_time <= start_time:
                 continue
 
-            db_key = (
-                raw_text,
-                url,
-                round(start_time, 3),
-                round(end_time, 3)
-            )
+            db_key = (raw_text, url, round(start_time, 3), round(end_time, 3))
             entry['split'] = db_tags.get(db_key, file_split)
 
             target_folder_name = existing_folders.get(raw_text, raw_text)
@@ -363,6 +413,9 @@ def load_and_filter_metadata(priority_map, min_samples=3):
         folder_path = os.path.join(MEDIA_DATASET_DIR, folder_name)
         existing_count = count_local_videos(folder_path)
 
+        # De-duplicate by primary clip key: the same clip can legitimately appear twice in the
+        # source JSON (or across train/val/test files); it must only count once toward the
+        # class's sample total and only be queued for download once.
         seen_pending_keys = set()
         for entry in entries:
             clip_keys = get_clip_keys(entry)
@@ -386,29 +439,73 @@ def load_and_filter_metadata(priority_map, min_samples=3):
     return valid_dataset
 
 
+# ==============================================================================
+# DOWNLOADING
+# ==============================================================================
+def resolve_ytdlp_command():
+    """Returns the argv prefix for yt-dlp (PATH executable, or `python -m yt_dlp`), or None if unavailable."""
+    if shutil.which("yt-dlp"):
+        return ["yt-dlp"]
+    try:
+        probe = subprocess.run([sys.executable, "-m", "yt_dlp", "--version"],
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        if probe.returncode == 0:
+            return [sys.executable, "-m", "yt_dlp"]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def cleanup_partial_files(output_path):
-    """Removes incomplete download fragments matching output_path.* on failure."""
-    stem, _ = os.path.splitext(output_path)
-    for candidate in glob.glob(f"{glob.escape(stem)}*"):
-        if os.path.isfile(candidate):
-            try:
-                os.remove(candidate)
-            except OSError:
-                pass
+    """Removes the target file plus yt-dlp leftovers (.part, .ytdl, .fNNN.mp4 fragments) for that clip."""
+    base = os.path.splitext(output_path)[0]
+    for path in glob.glob(glob.escape(base) + ".*"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
-def download_clip(url, start_time, end_time, output_path):
-    """Streams and trims YouTube clip (capped at 720p for fast landmark extraction) with yt-dlp + ffmpeg."""
-    if not url or float(end_time) <= float(start_time):
-        return False
+def classify_failure(stderr_text):
+    text = (stderr_text or "").lower()
+    if any(marker in text for marker in BLOCKED_ERROR_MARKERS):
+        return DL_BLOCKED
+    if any(marker in text for marker in PERMANENT_ERROR_MARKERS):
+        return DL_PERMANENT
+    return DL_TRANSIENT
+
+
+def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
+    """
+    Streams and trims a YouTube clip (capped at 720p for fast landmark extraction) with
+    yt-dlp + ffmpeg. Returns (status, detail) where status is one of
+    DL_OK / DL_PERMANENT / DL_TRANSIENT / DL_BLOCKED.
+
+    Downloads to a *staging* path and only os.replace()s it onto the real output_path after
+    yt-dlp confirms success. If the process is killed mid-download (SIGKILL, power loss, OOM),
+    only the staging file is left behind; its name doesn't end in a valid video extension, so
+    get_next_video_number()/count_local_videos() never count it, and the next run cleanly
+    retries the SAME clip number instead of mistaking the orphan for a finished download and
+    assigning the clip a new, duplicate filename.
+    """
+    if not url or end_time <= start_time:
+        return DL_PERMANENT, "invalid url or time range"
 
     if os.path.exists(output_path):
         if os.path.getsize(output_path) > 0:
-            return True
+            return DL_OK, "already on disk"
         os.remove(output_path)
 
-    cmd = [
-        "yt-dlp",
+    staging_path = output_path + ".partial"
+    # Debris from a previous crashed/killed attempt at this exact clip is now stale.
+    if os.path.exists(staging_path):
+        try:
+            os.remove(staging_path)
+        except OSError:
+            pass
+    cleanup_partial_files(staging_path)
+
+    cmd = ytdlp_cmd + [
         "--quiet",
         "--no-warnings",
         "--no-playlist",
@@ -416,28 +513,43 @@ def download_clip(url, start_time, end_time, output_path):
         "--merge-output-format", "mp4",
         "--external-downloader", "ffmpeg",
         "--external-downloader-args", f"ffmpeg_i:-ss {start_time} -to {end_time}",
-        "-o", output_path,
+        "-o", staging_path.replace('%', '%%'),  # '%' would otherwise be read as a yt-dlp template field
         "--",
         url
     ]
 
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
-        if result.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            return True
-    except Exception:
-        pass
+        result = subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=DOWNLOAD_TIMEOUT_SEC, encoding='utf-8', errors='replace'
+        )
+    except subprocess.TimeoutExpired:
+        cleanup_partial_files(staging_path)
+        return DL_TRANSIENT, f"timed out after {DOWNLOAD_TIMEOUT_SEC}s"
+    except OSError as exc:
+        cleanup_partial_files(staging_path)
+        return DL_TRANSIENT, f"could not launch yt-dlp: {exc}"
 
-    cleanup_partial_files(output_path)
-    return False
+    if result.returncode == 0 and os.path.isfile(staging_path) and os.path.getsize(staging_path) > 0:
+        os.replace(staging_path, output_path)  # atomic: the real filename appears only once complete
+        return DL_OK, ""
+
+    cleanup_partial_files(staging_path)
+    detail_lines = (result.stderr or "").strip().splitlines()
+    detail = detail_lines[-1] if detail_lines else f"exit code {result.returncode}"
+    return classify_failure(result.stderr), detail
 
 
+# ==============================================================================
+# MAIN LOOP
+# ==============================================================================
 def fetch_msasl_dataset():
     """Main execution loop: reads priority_signs.txt, downloads priority classes first, then general classes."""
-    if not shutil.which("yt-dlp") or not shutil.which("ffmpeg"):
+    ytdlp_cmd = resolve_ytdlp_command()
+    if ytdlp_cmd is None or not shutil.which("ffmpeg"):
         raise RuntimeError(
             "Both 'yt-dlp' and 'ffmpeg' must be installed and available on your PATH "
-            "before downloading MS-ASL clips."
+            "before downloading MS-ASL clips (pip install yt-dlp; install ffmpeg separately)."
         )
 
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
@@ -484,6 +596,10 @@ def fetch_msasl_dataset():
         print("\nAll eligible sign classes are already processed!")
         return
 
+    # Sort order:
+    # 1. Priority signs strictly before general signs
+    # 2. Classes with < MIN_VIDEOS_PER_CLASS existing clips first
+    # 3. Exact line order in priority_signs.txt (alphabetical fallback for general signs)
     classes_with_pending.sort(
         key=lambda x: (
             not x['is_priority'],
@@ -500,6 +616,8 @@ def fetch_msasl_dataset():
     print(f"Total sign classes with pending downloads: {len(classes_with_pending)} ({pending_priority_total} priority signs remaining)")
     print(f"Processing next {len(batch_classes)} sign classes in this batch...\n")
 
+    blocked = False
+
     for c_idx, item in enumerate(batch_classes, 1):
         folder_name = item['folder_name']
         label_dir = os.path.join(MEDIA_DATASET_DIR, folder_name)
@@ -513,7 +631,9 @@ def fetch_msasl_dataset():
         print(f"[{c_idx}/{len(batch_classes)}] {tier_tag} Sign Class: '{folder_name}' (Existing on disk: {item['existing_count']}, Pending in batch: {len(item['pending'])})")
 
         success_count = 0
-        failed_count = 0
+        unavailable_count = 0
+        retry_later_count = 0
+
         for entry, clip_key in item['pending']:
             url = (entry.get('url') or '').strip()
             start_time = parse_timestamp(entry.get('start_time'), 0.0) or 0.0
@@ -523,28 +643,50 @@ def fetch_msasl_dataset():
             file_name = f"{folder_name}_{next_num}_{tag}.mp4"
             output_path = os.path.join(label_dir, file_name)
 
-            success = download_clip(url, start_time, end_time, output_path)
-            if success:
+            status, detail = download_clip(ytdlp_cmd, url, start_time, end_time, output_path)
+
+            if status == DL_OK:
                 manifest[folder_name][clip_key] = file_name
                 success_count += 1
                 next_num += 1
-            else:
+            elif status == DL_PERMANENT:
                 manifest[folder_name][clip_key] = FAILED_MARKER
-                failed_count += 1
+                unavailable_count += 1
+            elif status == DL_TRANSIENT:
+                attempts = transient_attempts(manifest[folder_name].get(clip_key)) + 1
+                manifest[folder_name][clip_key] = f"{RETRY_PREFIX}{attempts}"
+                retry_later_count += 1
+                print(f"   [retry {attempts}/{MAX_TRANSIENT_ATTEMPTS}] {clip_key}: {detail}")
+            else:  # DL_BLOCKED: record nothing, stop so good clips aren't marked failed
+                print(f"\n[STOP] YouTube is throttling or blocking requests ({detail}).")
+                print("       Nothing was marked as failed. Wait a while (or try yt-dlp's --cookies-from-browser) and re-run.")
+                blocked = True
+                break
 
-        save_download_manifest(manifest)
+            # Save after EVERY clip: an interruption can never leave downloaded files unrecorded
+            # (which would otherwise cause them to be re-downloaded as duplicates next run).
+            save_download_manifest(manifest)
+
         total_now = count_local_videos(label_dir)
         print(
             f"   -> Downloaded {success_count}/{len(item['pending'])} new clips "
-            f"({failed_count} unavailable/failed). Current total in folder: {total_now}\n"
+            f"({unavailable_count} permanently unavailable, {retry_later_count} will retry). "
+            f"Current total in folder: {total_now}\n"
         )
+
+        if blocked:
+            break
+
+    save_download_manifest(manifest)
 
     remaining_classes = len(classes_with_pending) - len(batch_classes)
     remaining_priority = sum(1 for x in classes_with_pending[BATCH_SIZE_CLASSES:] if x['is_priority'])
     print("--- Batch Execution Summary ---")
-    if remaining_classes > 0:
+    if blocked:
+        print("Run stopped early because of YouTube throttling. Re-run later to continue.")
+    elif remaining_classes > 0:
         print(f"Batch completed! Remaining classes: {remaining_classes} ({remaining_priority} priority signs left).")
-        print(f"Run 'python {os.path.basename(__file__)}' again to process the next batch of 10 sign classes.")
+        print(f"Run 'python {os.path.basename(__file__)}' again to process the next batch of {BATCH_SIZE_CLASSES} sign classes.")
     else:
         print("All pending sign classes across the dataset have been processed!")
 
