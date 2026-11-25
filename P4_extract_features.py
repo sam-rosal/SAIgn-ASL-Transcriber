@@ -23,6 +23,11 @@ class HolisticSession:
     """Manages MediaPipe Holistic lifecycle with automatic recovery if a video corrupts the graph."""
 
     def __init__(self, min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        if not hasattr(mp, 'solutions'):
+            raise ImportError(
+                "This MediaPipe build does not expose the legacy 'mp.solutions' API. "
+                "Install a version that does, e.g.: pip install mediapipe==0.10.14"
+            )
         self._mp_holistic = mp.solutions.holistic
         self._det_conf = min_detection_confidence
         self._trk_conf = min_tracking_confidence
@@ -177,6 +182,9 @@ def ensure_tables_exist(cursor):
         row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
     }
     required_columns = {
+        'video_path': "TEXT",
+        'label': "TEXT",
+        'num_frames': "INTEGER",
         'clip_id': "INTEGER",
         'extracted_features_path': "TEXT",
         'npy_path': "TEXT",
@@ -246,7 +254,8 @@ def resolve_split_tag(cursor, video_file):
             """, (video_file,))
         result = cursor.fetchone()
         if result and result[0]:
-            return result[0].strip().lower()
+            split = str(result[0]).strip().lower()
+            return {'validation': 'val', 'valid': 'val', 'training': 'train'}.get(split, split)
     except sqlite3.OperationalError:
         pass
 
@@ -270,7 +279,8 @@ def is_valid_cached_npy(npy_path):
     try:
         arr = np.load(npy_path)
         return arr.shape == (TARGET_FRAMES, FEATURE_DIM) and bool(np.isfinite(arr).all())
-    except (OSError, ValueError):
+    except Exception:
+        # Corrupt/empty/truncated files can raise EOFError, UnpicklingError, etc. -> just re-extract.
         return False
 
 
