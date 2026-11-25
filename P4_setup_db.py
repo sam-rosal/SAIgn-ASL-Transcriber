@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import sys
 
 # Defining the database path using the file name
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -9,6 +10,63 @@ DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 DATASET_DIR = os.path.join(SCRIPT_DIR, 'media_dataset')
 FEATURES_DIR = os.path.join(SCRIPT_DIR, 'extracted_features')
 
+# Bump this whenever the seed values/units below change. A bump overwrites expression_thresholds ONCE;
+# on every other run existing rows (including your hand-tuned values) are preserved.
+# Must match EXPRESSION_SEED_VERSION in P4_run_system.py.
+EXPRESSION_SEED_VERSION = 2
+
+# Thresholds are RATIOS of face size (outer-eye-corner distance), measured in pixels -- see
+# detect_expressions() in P4_run_system.py for the exact metric behind each name.
+# NOTE: these are starting values derived from typical adult face proportions, NOT measured on your
+# webcam. Tune them directly in the expression_thresholds table; re-running setup won't overwrite them.
+EXPRESSIONS_SEED = [
+    ('mouthSmileLeft', 'Happy', 0.04),              # corner lift above upper-lip centre  (> thr)
+    ('mouthSmileRight', 'Happy', 0.04),
+    ('browInnerUp', 'Surprised', 0.27),             # inner brow to nose bridge           (> thr)
+    ('browLowerer', 'Angry', 0.22),                 # brow-to-eyelid gap                  (< thr)
+    ('browSquint', 'Confused / Question', 0.19),    # brow-to-eyelid gap, stricter        (< thr)
+    ('mouthFrownLeft', 'Sad / Concerned', 0.06),    # corner drop below upper-lip centre  (> thr)
+    ('mouthFrownRight', 'Sad / Concerned', 0.06),
+    ('noseSneerLeft', 'Disgust', 0.31),             # nose bridge to upper lip            (< thr)
+    ('noseSneerRight', 'Disgust', 0.31),
+    ('jawOpen', 'Shocked / Gasping', 0.20),         # inner-lip gap                       (> thr)
+    ('eyeWideLeft', 'Fearful / Startled', 0.15),    # eyelid opening                      (> thr)
+    ('eyeWideRight', 'Fearful / Startled', 0.15),
+    ('mouthPucker', 'Skeptical / Doubtful', 0.42),  # mouth width                         (< thr)
+    ('eyeSquintLeft', 'Suspicious / Wincing', 0.05),   # eyelid opening                   (< thr)
+    ('eyeSquintRight', 'Suspicious / Wincing', 0.05),
+    ('faceNeutral', 'Neutral', 0.000),
+]
+
+
+def seed_expression_thresholds(cursor, force=False):
+    """Seeds expression thresholds without clobbering user edits (see EXPRESSION_SEED_VERSION)."""
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );""")
+    row = cursor.execute("SELECT value FROM app_meta WHERE key = 'expression_seed_version';").fetchone()
+    stored = int(row[0]) if row and str(row[0]).strip().isdigit() else 0
+
+    if force or stored < EXPRESSION_SEED_VERSION:
+        cursor.executemany("""
+            INSERT OR REPLACE INTO expression_thresholds (blendshape_name, display_name, activation_threshold)
+            VALUES (?, ?, ?);
+        """, EXPRESSIONS_SEED)
+        cursor.execute(
+            "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('expression_seed_version', ?);",
+            (str(EXPRESSION_SEED_VERSION),)
+        )
+        print(f"Expression thresholds installed (seed v{EXPRESSION_SEED_VERSION}).")
+    else:
+        cursor.executemany("""
+            INSERT OR IGNORE INTO expression_thresholds (blendshape_name, display_name, activation_threshold)
+            VALUES (?, ?, ?);
+        """, EXPRESSIONS_SEED)
+        print("Expression thresholds already up to date; existing values preserved "
+              "(use --reset-expressions to restore defaults).")
+
 
 def ensure_training_dataset_columns(cursor):
     """Migrates older training_dataset tables so required columns and unique indexes exist."""
@@ -16,6 +74,9 @@ def ensure_training_dataset_columns(cursor):
         row[1] for row in cursor.execute("PRAGMA table_info(training_dataset);").fetchall()
     }
     required_columns = {
+        'video_path': "TEXT",
+        'label': "TEXT",
+        'num_frames': "INTEGER",
         'clip_id': "INTEGER",
         'extracted_features_path': "TEXT",
         'npy_path': "TEXT",
@@ -46,7 +107,7 @@ def init_system():
     os.makedirs(FEATURES_DIR, exist_ok=True)
 
     # 2. Setup SQLite Tables
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30.0)
     try:
         cursor = conn.cursor()
 
@@ -131,29 +192,8 @@ def init_system():
                 VALUES (?, ?, ?);
             """, gestures_seed)
 
-        # 4. Seed active non-manual facial expression markers
-        expressions_seed = [
-            ('mouthSmileLeft', 'Happy', 0.12),
-            ('mouthSmileRight', 'Happy', 0.12),
-            ('browInnerUp', 'Surprised', 0.035),
-            ('browLowerer', 'Angry', 0.025),
-            ('browSquint', 'Confused / Question', 0.020),
-            ('mouthFrownLeft', 'Sad / Concerned', 0.030),
-            ('mouthFrownRight', 'Sad / Concerned', 0.030),
-            ('noseSneerLeft', 'Disgust', 0.025),
-            ('noseSneerRight', 'Disgust', 0.025),
-            ('jawOpen', 'Shocked / Gasping', 0.045),
-            ('eyeWideLeft', 'Fearful / Startled', 0.028),
-            ('eyeWideRight', 'Fearful / Startled', 0.028),
-            ('mouthPucker', 'Skeptical / Doubtful', 0.065),
-            ('eyeSquintLeft', 'Suspicious / Wincing', 0.012),
-            ('eyeSquintRight', 'Suspicious / Wincing', 0.012),
-            ('faceNeutral', 'Neutral', 0.000)
-        ]
-        cursor.executemany("""
-            INSERT OR REPLACE INTO expression_thresholds (blendshape_name, display_name, activation_threshold)
-            VALUES (?, ?, ?);
-        """, expressions_seed)
+        # 4. Seed active non-manual facial expression markers (version-aware, preserves user edits)
+        seed_expression_thresholds(cursor, force='--reset-expressions' in sys.argv)
 
         conn.commit()
     finally:
