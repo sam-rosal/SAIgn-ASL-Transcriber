@@ -326,6 +326,7 @@ def register_and_process_dataset(verbose_skips=True):
         extraction_available = True
         no_split_count = 0
         unextracted_count = 0
+        failed_count = 0
 
         with HolisticSession(min_detection_confidence=0.5, min_tracking_confidence=0.5) as holistic_session:
             for label_dir in sorted(os.listdir(DATASET_DIR)):
@@ -368,22 +369,30 @@ def register_and_process_dataset(verbose_skips=True):
                         continue
 
                     print(f"Processing media: [{label_dir}] -> {video_file} (Split: {split_tag})...")
-                    raw_features = extract_video_landmarks(video_path, holistic_session)
-                    if len(raw_features) == 0:
-                        print(f"[WARN] No frames extracted from {video_file}. Skipping...")
-                        continue
+                    try:
+                        raw_features = extract_video_landmarks(video_path, holistic_session)
+                        if len(raw_features) == 0:
+                            print(f"[WARN] No frames extracted from {video_file}. Skipping...")
+                            continue
 
-                    segmented_features = apply_velocity_segmentation(raw_features)
-                    fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
+                        segmented_features = apply_velocity_segmentation(raw_features)
+                        fixed_features = resample_sequence(segmented_features, target_frames=TARGET_FRAMES)
 
-                    save_npy_atomic(output_feature_path, fixed_features)
-                    upsert_training_record(cursor, video_path, label_dir, len(fixed_features), output_feature_path, split_tag)
-                    conn.commit()
+                        save_npy_atomic(output_feature_path, fixed_features)
+                        upsert_training_record(cursor, video_path, label_dir, len(fixed_features), output_feature_path, split_tag)
+                        conn.commit()
+                    except Exception as exc:
+                        # A disk/permission error, SQLite lock, or any other unexpected failure on ONE
+                        # clip must never abort an hours-long batch run; log it and keep going.
+                        print(f"[ERROR] Failed to process {video_file}: {type(exc).__name__}: {exc}. Continuing...")
+                        failed_count += 1
 
         if no_split_count and not verbose_skips:
             print(f"[WARN] {no_split_count} video(s) skipped: no train/val/test tag in the filename or video_clips table.")
         if unextracted_count:
             print(f"[WARN] {unextracted_count} video(s) were NOT extracted and will be missing from training.")
+        if failed_count:
+            print(f"[WARN] {failed_count} video(s) failed to process due to an unexpected error and were skipped.")
     finally:
         conn.close()
 
