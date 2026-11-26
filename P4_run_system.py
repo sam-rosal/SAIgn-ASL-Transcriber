@@ -2,28 +2,41 @@ import json
 import operator
 import os
 import sqlite3
+import sys
 import unicodedata
 from collections import deque, Counter
 import cv2
 import numpy as np
 from keras.models import load_model
 import mediapipe as mp
-from scipy.interpolate import interp1d
+
+# --- System & Path Configurations ---
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:  # make the sibling P4_extract_features.py importable from any working dir
+    sys.path.insert(0, SCRIPT_DIR)
+
+# Live inference MUST preprocess its rolling frame window exactly the way training preprocessed clips,
+# or the model sees a systematically different encoding at inference time than it was trained on
+# (this silently hurt accuracy on low-motion/static signs before). Importing the same functions
+# training uses, instead of a separate hand-reimplementation, makes that drift impossible.
+from P4_extract_features import (  # noqa: E402
+    apply_velocity_segmentation,
+    resample_sequence,
+    TARGET_FRAMES,
+    FEATURE_DIM,
+)
 
 # ==============================================================================
 # PATHS & SYSTEM CONFIGURATION
 # ==============================================================================
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, 'saign_vision.db')
 MODEL_PATH = os.path.join(SCRIPT_DIR, 'asl_model.keras')
 CLASSES_PATH = os.path.join(SCRIPT_DIR, 'classes.json')
 MENU_ART_PATH = os.path.join(SCRIPT_DIR, 'saign_menu.png')  # main-menu artwork (falls back to a drawn menu)
 
-SEQUENCE_LENGTH = 30
+SEQUENCE_LENGTH = TARGET_FRAMES          # kept in sync with P4_extract_features.py by import, not by copy
+EXPECTED_FEATURE_DIM = FEATURE_DIM       # ditto
 RAW_CAPTURE_WINDOW = 45  # ~1.5s rolling capture buffer before velocity segmentation + resampling
-VELOCITY_THRESHOLD = 0.015
-MIN_ACTIVE_FRAMES = 10
-EXPECTED_FEATURE_DIM = 225  # Pose (99) + Left Hand (63) + Right Hand (63)
 EXPRESSION_SEED_VERSION = 2  # Must match P4_setup_db.py. v2 = face-size-normalised ratio thresholds.
 
 DEBOUNCE_WINDOW_SIZE = 8
@@ -175,40 +188,15 @@ def extract_landmarks(results):
 
 def prepare_live_sequence(raw_buffer, target_frames=SEQUENCE_LENGTH):
     """
-    Mirrors P4_extract_features.py preprocessing on the live rolling window:
-    filters static transition frames via L2 velocity and resamples active motion
-    to target_frames (30), falling back to the latest 30 raw frames for static signs.
+    Applies the EXACT SAME preprocessing training used (apply_velocity_segmentation then
+    resample_sequence, both imported from P4_extract_features.py) to the live rolling window,
+    so a static/low-motion sign is encoded the same way live as it was during training -- instead
+    of a separately-written approximation that can silently drift out of sync with training.
     """
     features = np.array(raw_buffer, dtype=np.float32)
-
-    if len(features) >= 2:
-        frame_differences = features[1:] - features[:-1]
-        velocities = np.linalg.norm(frame_differences, axis=1)
-        active_mask = np.ones(len(features), dtype=bool)
-        active_mask[1:] = velocities >= VELOCITY_THRESHOLD
-        filtered = features[active_mask]
-
-        if len(filtered) >= MIN_ACTIVE_FRAMES:
-            features = filtered
-        else:
-            features = features[-target_frames:]
-
-    current_frames = len(features)
-    if current_frames == 0:
-        feat_cols = features.shape[1] if features.ndim == 2 else EXPECTED_FEATURE_DIM
-        return np.zeros((target_frames, feat_cols), dtype=np.float32)
-
-    if current_frames == target_frames:
-        return np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0)
-
-    if current_frames < 2:
-        pad_amount = max(0, target_frames - current_frames)
-        return np.pad(features, ((0, pad_amount), (0, 0)), mode='edge')[:target_frames]
-
-    x_old = np.linspace(0, 1, num=current_frames)
-    x_new = np.linspace(0, 1, num=target_frames)
-    interpolator = interp1d(x_old, features, axis=0, kind='linear')
-    return np.nan_to_num(interpolator(x_new).astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    segmented = apply_velocity_segmentation(features)
+    resampled = resample_sequence(segmented, target_frames=target_frames)
+    return np.nan_to_num(resampled, nan=0.0, posinf=0.0, neginf=0.0)
 
 
 def detect_expressions(results, thresholds, image_size=None):
