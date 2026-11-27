@@ -77,6 +77,27 @@ class HolisticSession:
             raise
 
 
+def extract_frame_landmarks(results):
+    """
+    Flattens ONE MediaPipe Holistic result into a single float32 vector of FEATURE_DIM (225) values:
+    pose (33*3) + left hand (21*3) + right hand (21*3). A body part that was not detected becomes zeros.
+
+    Single source of truth for the per-frame feature layout: training-time extraction
+    (extract_video_landmarks, below) AND live inference (P4_run_system.py) both call this, so the two
+    can never encode a frame differently.
+    """
+    pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
+
+    lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
+    rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
+        if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
+
+    return np.nan_to_num(np.concatenate([pose, lh, rh]), nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def extract_video_landmarks(video_path, holistic_session):
     """
     Reads a video frame-by-frame, runs MediaPipe Holistic tracking, and converts
@@ -101,16 +122,7 @@ def extract_video_landmarks(video_path, holistic_session):
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             results = holistic_session.process(rgb_frame)
 
-            pose = np.array([[res.x, res.y, res.z] for res in results.pose_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.pose_landmarks else np.zeros(33 * 3, dtype=np.float32)
-
-            lh = np.array([[res.x, res.y, res.z] for res in results.left_hand_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.left_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
-
-            rh = np.array([[res.x, res.y, res.z] for res in results.right_hand_landmarks.landmark], dtype=np.float32).flatten() \
-                if results.right_hand_landmarks else np.zeros(21 * 3, dtype=np.float32)
-
-            frame_coordinates = np.concatenate([pose, lh, rh])
+            frame_coordinates = extract_frame_landmarks(results)
             video_features.append(frame_coordinates)
     except Exception as e:
         print(f"[WARN] MediaPipe processing error on '{video_path}': {e}. Skipping...")
