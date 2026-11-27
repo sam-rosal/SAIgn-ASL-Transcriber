@@ -278,8 +278,8 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
 
     if not hasattr(mp, 'solutions'):
         raise ImportError(
-            "This MediaPipe build does not expose the legacy 'mp.solutions' API. "
-            "Install a version that does, e.g.: pip install mediapipe==0.10.14"
+            "This MediaPipe version has no legacy 'mp.solutions' API. "
+            "Fix: pip install mediapipe==0.10.14"
         )
     mp_holistic = mp.solutions.holistic
 
@@ -304,8 +304,10 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
             while cap.isOpened():
                 ret, frame = cap.read()
                 if not ret or frame is None:
-                    print("[WARN] Failed to read frame from webcam. Ending capture session.")
-                    break
+                    raise RuntimeError(
+                        "The camera stopped delivering frames. Check the connection and that no other "
+                        "app is using it, then press Start again."
+                    )
                 if frame.size == 0:
                     continue
 
@@ -318,8 +320,10 @@ def run_recognition_engine(model, trained_labels, gesture_cache, expression_thre
                     consecutive_errors += 1
                     print(f"[WARN] MediaPipe processing error ({consecutive_errors}/5): {e}")
                     if consecutive_errors >= 5:
-                        print("[ERROR] Too many consecutive MediaPipe errors. Ending capture session.")
-                        break
+                        raise RuntimeError(
+                            "MediaPipe failed repeatedly while processing camera frames (details in the console). "
+                            "Press Start to try again."
+                        )
                     try:
                         holistic.reset()
                     except Exception:
@@ -445,8 +449,8 @@ def main():
         elif action == 'START':
             try:
                 run_recognition_engine(model, trained_labels, gesture_cache, expression_thresholds, seq_len)
-            except RuntimeError as e:
-                # e.g. webcam unavailable: report and return to the menu instead of crashing
+            except (RuntimeError, ImportError) as e:
+                # e.g. webcam unavailable / MediaPipe without mp.solutions: report on the menu instead of crashing
                 print(f"[ERROR] {e}")
                 menu_message = str(e)
 

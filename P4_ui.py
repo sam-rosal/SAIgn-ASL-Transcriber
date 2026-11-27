@@ -450,6 +450,7 @@ class LiveScreen:
         self.fullscreen = False
         self.mouse = (-1, -1)
         self._pending = set()
+        self._back_requested = False   # 'Menu' click remembered until handle_key() reports it
         self._gradient_cache = None
         self.transcript = deque(maxlen=TRANSCRIPT_MAX)
         self._last_logged = None
@@ -543,17 +544,23 @@ class LiveScreen:
             self.fullscreen = False
 
     def _apply_pending(self):
-        """Runs actions queued by the mouse callback. Returns True if 'back to menu' was requested."""
+        """
+        Runs actions queued by the mouse callback. A 'back to menu' request is remembered in
+        self._back_requested (not just returned): render() also calls this, and a click that lands
+        between handle_key() and the next render() used to be swallowed there, leaving the user stuck.
+        """
         pending, self._pending = self._pending, set()
         if 'help' in pending:
             self.toggle_help()
         if 'fullscreen' in pending:
             self.toggle_fullscreen()
-        return 'menu' in pending
+        if 'menu' in pending:
+            self._back_requested = True
 
     def handle_key(self, key):
         """Processes a keypress plus any queued mouse clicks. Returns True to go back to the menu."""
-        back = self._apply_pending()
+        self._apply_pending()
+        back, self._back_requested = self._back_requested, False
         if key == 27:
             back = True
         elif key in (ord('h'), ord('H')):
