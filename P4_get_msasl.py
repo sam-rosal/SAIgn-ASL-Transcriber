@@ -1,12 +1,15 @@
+import argparse
 import glob
 import json
 import os
+import random
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 from collections import defaultdict
 
 # ==============================================================================
@@ -25,9 +28,41 @@ JSON_FILES = [
 ]
 
 MIN_VIDEOS_PER_CLASS = 3
-BATCH_SIZE_CLASSES = 10  # Process 10 sign classes per execution run
+BATCH_SIZE_CLASSES = 20  # Process _ signs classes per execution run (up to developer discretion; smaller batches are safer for flaky networks or throttled YouTube access)
 VALID_VIDEO_EXTS = ('.mp4', '.avi', '.mov', '.mkv')
 DOWNLOAD_TIMEOUT_SEC = 120
+
+# Pause (random, in this range of seconds) between actual downloads. YouTube rate-limits rapid repeated
+# requests (~300 videos/hour for guest sessions, ~2000/hour when signed in); the yt-dlp wiki recommends
+# 5-10 s between downloads. Set to (0, 0) to disable.
+DOWNLOAD_DELAY_RANGE_SEC = (5.0, 10.0)
+
+# Stop the run (and un-count those attempts) after this many transient failures IN A ROW. That pattern
+# means YouTube/network trouble, not individually bad clips, so it must not burn per-clip retry budgets.
+MAX_CONSECUTIVE_TRANSIENT = 5
+
+# Public, long-lived video used by the pre-flight check ("Me at the zoo", YouTube's first upload).
+PREFLIGHT_URL = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+# YouTube Authentication Configuration
+# YouTube now often demands a signed-in session ("Please sign in" / "confirm you're not a bot").
+# Cookie source, highest priority first (the one in use is printed at startup):
+#   1. --browser NAME / --cookies-file PATH on the command line (override everything below)
+#   2. a cookies.txt file (Netscape format) in this folder  <- MOST RELIABLE, see how-to below
+#   3. COOKIES_FROM_BROWSER, e.g. "firefox", "chrome", "edge", "brave", "safari",
+#      or with a profile: "chrome:Profile 1" / "firefox:myprofile"
+#
+# Why cookies.txt is most reliable: YouTube rotates cookies in any browser tab that stays open, which
+# silently invalidates live browser cookies. To export cookies that are never rotated:
+#   a. open a NEW private/incognito window and sign in to YouTube (a throwaway Google account is wise:
+#      automated use of an account can get it flagged),
+#   b. in that same tab go to https://www.youtube.com/robots.txt (keep it the only private tab),
+#   c. export youtube.com cookies with a "cookies.txt" extension (e.g. "Get cookies.txt LOCALLY"),
+#   d. save the file as cookies.txt next to this script, then CLOSE the private window (don't sign out).
+# Chrome/Edge on Windows encrypt their cookie store so yt-dlp often cannot read it: use Firefox or cookies.txt.
+COOKIES_FROM_BROWSER = "chrome"
+COOKIES_FILE_PATH = os.path.join(SCRIPT_DIR, 'cookies.txt')
+NO_COOKIES = False  # set by --no-cookies
 
 # Manifest status values (per clip): "<filename>" = downloaded, FAILED_MARKER = permanently
 # unavailable, "__RETRY__:<n>" = n transient failures so far (timeouts, flaky network, ...).
@@ -48,8 +83,20 @@ PERMANENT_ERROR_MARKERS = (
     "copyright", "members-only", "join this channel", "confirm your age",
     "is not a valid url", "unsupported url", "incomplete youtube id",
 )
-# yt-dlp error text meaning YouTube is throttling/blocking us: stop instead of poisoning the manifest
-BLOCKED_ERROR_MARKERS = ("not a bot", "http error 429", "too many requests")
+# yt-dlp error text meaning YouTube is throttling/blocking us or demands sign-in: stop instead of poisoning the manifest
+BLOCKED_ERROR_MARKERS = (
+    "not a bot", "http error 429", "too many requests",
+    "please sign in", "sign in to confirm", "use --cookies-from-browser",
+)
+# yt-dlp could not READ or USE the configured cookies. Every later clip would fail the same way, so stop.
+COOKIE_PROBLEM_MARKERS = (
+    "cookie database", "cookies database", "failed to decrypt", "keyring",
+    "no longer valid", "likely been rotated", "not a supported browser", "unsupported browser",
+)
+AGE_GATE_MARKER = "confirm your age"
+JS_RUNTIME_WARNING_MARKER = "no supported javascript runtime"
+ALREADY_ON_DISK = "already on disk"
+NO_NETWORK_DETAILS = (ALREADY_ON_DISK, "invalid url or time range")
 
 DL_OK, DL_PERMANENT, DL_TRANSIENT, DL_BLOCKED = "ok", "permanent", "transient", "blocked"
 
@@ -225,12 +272,14 @@ def transient_attempts(status):
     return 0
 
 
-def is_clip_handled(folder_name, folder_path, clip_keys, manifest, retry_failed=RETRY_FAILED):
+def is_clip_handled(folder_name, folder_path, clip_keys, manifest, retry_failed=None):
     """
     True if NONE of a clip's candidate keys need another download attempt: the clip is on disk,
     permanently unavailable, or has exhausted its transient-retry budget. Checking every
     candidate key keeps old (legacy-format) manifest records recognized across upgrades.
     """
+    if retry_failed is None:
+        retry_failed = RETRY_FAILED  # read at call time so the --retry-failed flag takes effect
     folder_manifest = manifest.get(folder_name)
     if not isinstance(folder_manifest, dict):
         return False
@@ -456,8 +505,23 @@ def resolve_ytdlp_command():
     return None
 
 
-def classify_failure(stderr_text):
+def summarize_error(stderr_text):
+    """Most informative single line of yt-dlp stderr: the last 'ERROR' line, else the last non-empty line."""
+    lines = [ln.strip() for ln in (stderr_text or "").splitlines() if ln.strip()]
+    errors = [ln for ln in lines if ln.upper().startswith("ERROR")]
+    if errors:
+        return errors[-1]
+    return lines[-1] if lines else ""
+
+
+def classify_failure(stderr_text, have_cookies=True):
     text = (stderr_text or "").lower()
+    if any(marker in text for marker in COOKIE_PROBLEM_MARKERS):
+        return DL_BLOCKED
+    # Age-gate with a signed-in session configured = this particular clip is out of reach (e.g. the account
+    # is not age-verified). Without cookies, cookies are the fix, so stop and tell the user instead.
+    if AGE_GATE_MARKER in text and "not a bot" not in text:
+        return DL_PERMANENT if have_cookies else DL_BLOCKED
     if any(marker in text for marker in BLOCKED_ERROR_MARKERS):
         return DL_BLOCKED
     if any(marker in text for marker in PERMANENT_ERROR_MARKERS):
@@ -465,10 +529,85 @@ def classify_failure(stderr_text):
     return DL_TRANSIENT
 
 
+def get_cookie_args():
+    """Builds yt-dlp authentication flags: cookies.txt first, then browser cookies (see config notes)."""
+    if NO_COOKIES:
+        return []
+    if COOKIES_FILE_PATH and os.path.isfile(COOKIES_FILE_PATH):
+        return ["--cookies", COOKIES_FILE_PATH]
+    if COOKIES_FROM_BROWSER:
+        return ["--cookies-from-browser", COOKIES_FROM_BROWSER]
+    return []
+
+
+def describe_cookie_source():
+    args = get_cookie_args()
+    if not args:
+        return "none (guest session)"
+    if args[0] == "--cookies":
+        return f"cookies file {args[1]}"
+    return f"{args[1]} browser cookies"
+
+
+_JS_SUPPORT_CACHE = {}
+
+
+def ytdlp_supports_js_runtimes(ytdlp_cmd):
+    """True if this yt-dlp knows --js-runtimes (added together with YouTube JS-runtime support, 2025.11.12)."""
+    key = tuple(ytdlp_cmd)
+    if key not in _JS_SUPPORT_CACHE:
+        try:
+            probe = subprocess.run(ytdlp_cmd + ["--help"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=30, encoding='utf-8', errors='replace')
+            _JS_SUPPORT_CACHE[key] = "--js-runtimes" in (probe.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            _JS_SUPPORT_CACHE[key] = False
+    return _JS_SUPPORT_CACHE[key]
+
+
+def get_js_runtime_args(ytdlp_cmd):
+    """
+    Recent yt-dlp needs an external JavaScript runtime for full YouTube support. Deno is used
+    automatically when installed; Node/Bun must be enabled explicitly. Returns [] when not applicable.
+    """
+    if not ytdlp_supports_js_runtimes(ytdlp_cmd):
+        return []
+    if shutil.which("deno"):
+        return []
+    for runtime in ("node", "bun"):
+        if shutil.which(runtime):
+            return ["--js-runtimes", runtime]
+    return []
+
+
+def diagnose_failure(stderr_text, have_cookies):
+    """Human-readable, actionable explanations for the failure patterns seen in yt-dlp's stderr."""
+    text = (stderr_text or "").lower()
+    hints = []
+    if any(m in text for m in COOKIE_PROBLEM_MARKERS):
+        hints.append("yt-dlp could not read or use your cookies (browser cookie store locked/encrypted, or the "
+                     "cookies were rotated by YouTube). Close the browser, or export a fresh cookies.txt from a "
+                     "private window (see the notes above COOKIES_FROM_BROWSER) and re-run.")
+    if any(m in text for m in ("please sign in", "sign in to confirm", "not a bot", "use --cookies-from-browser")):
+        if not have_cookies:
+            hints.append("YouTube wants a signed-in session and no cookies are configured. Add a cookies.txt next to "
+                         "this script, or run with --browser firefox (or chrome, edge, brave).")
+        else:
+            hints.append("YouTube rejected the cookies in use (not signed in, rotated, or the account/IP is flagged). "
+                         "Export a FRESH cookies.txt from a private window while signed in (a throwaway account is "
+                         "safest), wait some time if you were rate-limited, then re-run.")
+    if "http error 429" in text or "too many requests" in text or "rate-limit" in text or "rate limit" in text:
+        hints.append("YouTube is rate-limiting this IP/session. Wait an hour or so; keep DOWNLOAD_DELAY_RANGE_SEC at 5-10 s or higher.")
+    if JS_RUNTIME_WARNING_MARKER in text:
+        hints.append("No JavaScript runtime found for yt-dlp (needed for full YouTube support). Install Deno "
+                     "(https://deno.com) or Node 20+, and update yt-dlp: pip install -U \"yt-dlp[default]\".")
+    return hints
+
+
 def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
     """
     Streams and trims a YouTube clip (capped at 720p for fast landmark extraction) with
-    yt-dlp + ffmpeg. Returns (status, detail) where status is one of
+    yt-dlp + ffmpeg. Returns (status, detail, stderr_text) where status is one of
     DL_OK / DL_PERMANENT / DL_TRANSIENT / DL_BLOCKED.
 
     yt-dlp's own docs warn against hard-coding a file extension in -o ("is not recommended and
@@ -494,11 +633,11 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
     that could be miscounted, and it's removed in `finally` either way.
     """
     if not url or end_time <= start_time:
-        return DL_PERMANENT, "invalid url or time range"
+        return DL_PERMANENT, "invalid url or time range", ""
 
     if os.path.exists(output_path):
         if os.path.getsize(output_path) > 0:
-            return DL_OK, "already on disk"
+            return DL_OK, ALREADY_ON_DISK, ""
         os.remove(output_path)
 
     label_dir = os.path.dirname(output_path)
@@ -512,9 +651,10 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
 
     staging_dir = tempfile.mkdtemp(dir=label_dir, prefix='.dl_staging_')
     try:
+        cookie_args = get_cookie_args()
+        # Warnings are deliberately NOT suppressed: they carry the cookie / JS-runtime diagnostics.
         cmd = ytdlp_cmd + [
             "--quiet",
-            "--no-warnings",
             "--no-playlist",
             "--format", "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format", "mp4",
@@ -524,6 +664,8 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
             # form, so its post-merge extension-correction logic has nothing ambiguous to collide
             # with (see docstring above).
             "-o", os.path.join(staging_dir, "clip.%(ext)s"),
+            *get_js_runtime_args(ytdlp_cmd),
+            *cookie_args,
             "--",
             url
         ]
@@ -534,9 +676,9 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
                 timeout=DOWNLOAD_TIMEOUT_SEC, encoding='utf-8', errors='replace'
             )
         except subprocess.TimeoutExpired:
-            return DL_TRANSIENT, f"timed out after {DOWNLOAD_TIMEOUT_SEC}s"
+            return DL_TRANSIENT, f"timed out after {DOWNLOAD_TIMEOUT_SEC}s", ""
         except OSError as exc:
-            return DL_TRANSIENT, f"could not launch yt-dlp: {exc}"
+            return DL_TRANSIENT, f"could not launch yt-dlp: {exc}", ""
 
         junk_suffixes = ('.part', '.ytdl', '.aria2', '.temp')
         produced = [
@@ -546,22 +688,59 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
 
         if result.returncode == 0 and len(produced) == 1 and os.path.getsize(produced[0]) > 0:
             os.replace(produced[0], output_path)  # real filename appears only once complete
-            return DL_OK, ""
+            return DL_OK, "", ""
 
-        detail_lines = (result.stderr or "").strip().splitlines()
-        if result.returncode == 0 and not detail_lines:
+        stderr_text = result.stderr or ""
+        if result.returncode == 0 and not stderr_text.strip():
             detail = "yt-dlp reported success (exit code 0) but produced no single matching output file"
         else:
-            detail = detail_lines[-1] if detail_lines else f"exit code {result.returncode}"
-        return classify_failure(result.stderr), detail
+            detail = summarize_error(stderr_text) or f"exit code {result.returncode}"
+        return classify_failure(stderr_text, bool(cookie_args)), detail, stderr_text
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def run_preflight(ytdlp_cmd):
+    """
+    One cheap yt-dlp request (metadata only, no download) against a public video, using the configured
+    cookies, BEFORE touching the dataset. Returns False only when the failure would block every download.
+    """
+    print("Running pre-flight check against YouTube...")
+    cookie_args = get_cookie_args()
+    cmd = ytdlp_cmd + [
+        "--simulate", "--no-playlist", "--print", "id",
+        *get_js_runtime_args(ytdlp_cmd), *cookie_args, "--", PREFLIGHT_URL
+    ]
+    try:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=90, encoding='utf-8', errors='replace')
+    except (subprocess.SubprocessError, OSError) as exc:
+        print(f"[WARN] Pre-flight check could not complete ({exc}). Continuing anyway.")
+        return True
+
+    stderr_text = result.stderr or ""
+    hints = diagnose_failure(stderr_text, bool(cookie_args))
+
+    if result.returncode == 0:
+        print("[OK] yt-dlp can reach YouTube with the current settings.")
+        for hint in hints:
+            print(f"[WARN] {hint}")
+        print("     (This check cannot prove the cookies are signed in; if clips still ask you to sign in, refresh them.)")
+        return True
+
+    print(f"[PRE-FLIGHT FAILED] {summarize_error(stderr_text) or 'exit code ' + str(result.returncode)}")
+    for hint in hints:
+        print(f"  -> {hint}")
+    if classify_failure(stderr_text, bool(cookie_args)) == DL_BLOCKED:
+        return False
+    print("[WARN] This looks like a temporary or network problem, not a sign-in block. Continuing anyway.")
+    return True
 
 
 # ==============================================================================
 # MAIN LOOP
 # ==============================================================================
-def fetch_msasl_dataset():
+def fetch_msasl_dataset(skip_preflight=False):
     """Main execution loop: reads priority_signs.txt, downloads priority classes first, then general classes."""
     ytdlp_cmd = resolve_ytdlp_command()
     if ytdlp_cmd is None or not shutil.which("ffmpeg"):
@@ -569,6 +748,15 @@ def fetch_msasl_dataset():
             "Both 'yt-dlp' and 'ffmpeg' must be installed and available on your PATH "
             "before downloading MS-ASL clips (pip install yt-dlp; install ffmpeg separately)."
         )
+
+    have_cookies = bool(get_cookie_args())
+    print(f"YouTube cookies: {describe_cookie_source()}")
+    if not have_cookies:
+        print("[WARN] No YouTube cookies configured. If YouTube asks you to sign in, add a cookies.txt next to this script or use --browser NAME.")
+
+    if not skip_preflight and not run_preflight(ytdlp_cmd):
+        print("\nStopping before any download: fix the problem above, then re-run (nothing was changed in your dataset or manifest).")
+        return
 
     os.makedirs(MEDIA_DATASET_DIR, exist_ok=True)
     priority_map = load_priority_map(PRIORITY_FILE_PATH)
@@ -635,6 +823,9 @@ def fetch_msasl_dataset():
     print(f"Processing next {len(batch_classes)} sign classes in this batch...\n")
 
     blocked = False
+    stop_message = ""
+    transient_streak = []      # (folder, clip_key, previous manifest value) for failures in a row
+    did_network_call = False
 
     for c_idx, item in enumerate(batch_classes, 1):
         folder_name = item['folder_name']
@@ -661,23 +852,49 @@ def fetch_msasl_dataset():
             file_name = f"{folder_name}_{next_num}_{tag}.mp4"
             output_path = os.path.join(label_dir, file_name)
 
-            status, detail = download_clip(ytdlp_cmd, url, start_time, end_time, output_path)
+            if did_network_call and DOWNLOAD_DELAY_RANGE_SEC[1] > 0:
+                time.sleep(random.uniform(*DOWNLOAD_DELAY_RANGE_SEC))  # be polite: avoids rate limits
+
+            status, detail, stderr_text = download_clip(ytdlp_cmd, url, start_time, end_time, output_path)
+            if detail not in NO_NETWORK_DETAILS:
+                did_network_call = True
 
             if status == DL_OK:
                 manifest[folder_name][clip_key] = file_name
                 success_count += 1
                 next_num += 1
+                transient_streak.clear()
             elif status == DL_PERMANENT:
                 manifest[folder_name][clip_key] = FAILED_MARKER
                 unavailable_count += 1
+                transient_streak.clear()
             elif status == DL_TRANSIENT:
-                attempts = transient_attempts(manifest[folder_name].get(clip_key)) + 1
+                previous = manifest[folder_name].get(clip_key)
+                attempts = transient_attempts(previous) + 1
                 manifest[folder_name][clip_key] = f"{RETRY_PREFIX}{attempts}"
                 retry_later_count += 1
                 print(f"   [retry {attempts}/{MAX_TRANSIENT_ATTEMPTS}] {clip_key}: {detail}")
+                transient_streak.append((folder_name, clip_key, previous))
+                if len(transient_streak) >= MAX_CONSECUTIVE_TRANSIENT:
+                    # Many failures in a row = a systemic problem. Un-count them so no clip loses retry budget.
+                    for f_name, c_key, prev in transient_streak:
+                        if prev is None:
+                            manifest[f_name].pop(c_key, None)
+                        else:
+                            manifest[f_name][c_key] = prev
+                    print(f"\n[STOP] {MAX_CONSECUTIVE_TRANSIENT} downloads in a row failed temporarily (last: {detail}).")
+                    print("       Those attempts were NOT counted against the clips' retry budgets.")
+                    for hint in diagnose_failure(stderr_text, have_cookies):
+                        print(f"  -> {hint}")
+                    stop_message = "Run stopped early after repeated temporary failures. Check your connection / YouTube access and re-run."
+                    blocked = True
+                    break
             else:  # DL_BLOCKED: record nothing, stop so good clips aren't marked failed
-                print(f"\n[STOP] YouTube is throttling or blocking requests ({detail}).")
-                print("       Nothing was marked as failed. Wait a while (or try yt-dlp's --cookies-from-browser) and re-run.")
+                print(f"\n[STOP] YouTube is blocking requests or the cookies are not usable ({detail}).")
+                print("       Nothing was marked as failed.")
+                for hint in diagnose_failure(stderr_text, have_cookies):
+                    print(f"  -> {hint}")
+                stop_message = "Run stopped early because of YouTube sign-in enforcement or throttling. Fix the cookies (see above) and re-run."
                 blocked = True
                 break
 
@@ -701,7 +918,7 @@ def fetch_msasl_dataset():
     remaining_priority = sum(1 for x in classes_with_pending[BATCH_SIZE_CLASSES:] if x['is_priority'])
     print("--- Batch Execution Summary ---")
     if blocked:
-        print("Run stopped early because of YouTube throttling. Re-run later to continue.")
+        print(stop_message)
     elif remaining_classes > 0:
         print(f"Batch completed! Remaining classes: {remaining_classes} ({remaining_priority} priority signs left).")
         print(f"Run 'python {os.path.basename(__file__)}' again to process the next batch of {BATCH_SIZE_CLASSES} sign classes.")
@@ -709,5 +926,53 @@ def fetch_msasl_dataset():
         print("All pending sign classes across the dataset have been processed!")
 
 
+
+def reset_transient_retries():
+    """Clears '__RETRY__:<n>' records (e.g. ones burned by earlier sign-in errors) so those clips are retried."""
+    manifest = load_download_manifest()
+    cleared = 0
+    for clips in manifest.values():
+        if isinstance(clips, dict):
+            for key in [k for k, v in clips.items() if isinstance(v, str) and v.startswith(RETRY_PREFIX)]:
+                del clips[key]
+                cleared += 1
+    if cleared:
+        save_download_manifest(manifest)
+    print(f"Reset {cleared} temporary-failure record(s) in the download manifest.")
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Download MS-ASL sign clips from YouTube (in batches).")
+    parser.add_argument("--browser", metavar="NAME[:PROFILE]",
+                        help="read cookies from this browser (firefox, chrome, edge, brave, safari); overrides cookies.txt")
+    parser.add_argument("--cookies-file", metavar="PATH", help="use this Netscape cookies.txt file")
+    parser.add_argument("--no-cookies", action="store_true", help="do not send any cookies (guest session)")
+    parser.add_argument("--skip-preflight", action="store_true", help="skip the YouTube pre-flight check")
+    parser.add_argument("--reset-retries", action="store_true",
+                        help="forget earlier temporary-failure counts (fixes clips wrongly skipped after sign-in errors)")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="also re-attempt clips previously recorded as permanently unavailable")
+    return parser.parse_args(argv)
+
+
+def apply_cli_overrides(args):
+    global COOKIES_FROM_BROWSER, COOKIES_FILE_PATH, NO_COOKIES, RETRY_FAILED
+    if args.retry_failed:
+        RETRY_FAILED = True
+    if args.no_cookies:
+        NO_COOKIES = True
+    elif args.browser:
+        COOKIES_FROM_BROWSER = args.browser
+        COOKIES_FILE_PATH = None  # an explicit browser choice beats a stale cookies.txt
+    elif args.cookies_file:
+        if not os.path.isfile(args.cookies_file):
+            raise SystemExit(f"[ERROR] --cookies-file not found: {args.cookies_file}")
+        COOKIES_FILE_PATH = os.path.abspath(args.cookies_file)
+
+
 if __name__ == "__main__":
-    fetch_msasl_dataset()
+    cli_args = parse_args()
+    apply_cli_overrides(cli_args)
+    if cli_args.reset_retries:
+        reset_transient_retries()
+    fetch_msasl_dataset(skip_preflight=cli_args.skip_preflight)
