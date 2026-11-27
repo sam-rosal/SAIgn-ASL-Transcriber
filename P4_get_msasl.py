@@ -456,16 +456,6 @@ def resolve_ytdlp_command():
     return None
 
 
-def cleanup_partial_files(output_path):
-    """Removes the target file plus yt-dlp leftovers (.part, .ytdl, .fNNN.mp4 fragments) for that clip."""
-    base = os.path.splitext(output_path)[0]
-    for path in glob.glob(glob.escape(base) + ".*"):
-        try:
-            os.remove(path)
-        except OSError:
-            pass
-
-
 def classify_failure(stderr_text):
     text = (stderr_text or "").lower()
     if any(marker in text for marker in BLOCKED_ERROR_MARKERS):
@@ -481,12 +471,27 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
     yt-dlp + ffmpeg. Returns (status, detail) where status is one of
     DL_OK / DL_PERMANENT / DL_TRANSIENT / DL_BLOCKED.
 
-    Downloads to a *staging* path and only os.replace()s it onto the real output_path after
-    yt-dlp confirms success. If the process is killed mid-download (SIGKILL, power loss, OOM),
-    only the staging file is left behind; its name doesn't end in a valid video extension, so
-    get_next_video_number()/count_local_videos() never count it, and the next run cleanly
-    retries the SAME clip number instead of mistaking the orphan for a finished download and
-    assigning the clip a new, duplicate filename.
+    yt-dlp's own docs warn against hard-coding a file extension in -o ("is not recommended and
+    could break some post-processing") because when --merge-output-format has to remux/merge
+    streams, "the actual output filename might differ" from the literal name you passed. An
+    earlier version of this function hard-coded a literal ".partial" suffix after ".mp4" in -o;
+    yt-dlp would then silently write the real file under a DIFFERENT name (e.g.
+    "clip.mp4.partial.mp4"), so every download looked like a failure (yt-dlp itself reported exit
+    code 0, but our literal expected path never appeared) -- and the cleanup step then deleted the
+    real file it mistook for leftover debris, before the clip was ever retried.
+
+    A second attempt fixed that by using the %(ext)s template field, but appended it as the final
+    component of a name still living directly in label_dir -- so the resulting file legitimately
+    ended in ".mp4" and get_next_video_number()/count_local_videos() (which only check the
+    extension) miscounted an in-progress download as an already-finished clip, reintroducing a
+    duplicate-on-crash bug through a different path.
+
+    The fix here: download into a disposable temp SUBDIRECTORY inside label_dir, using yt-dlp's
+    own recommended "name.%(ext)s" pattern with nothing after the extension field (its documented
+    safe form). Whatever file yt-dlp actually produces, under whatever extension, is found by
+    glob afterward and moved onto output_path -- the temp directory itself is never mistaken for a
+    video file (directories don't match VALID_VIDEO_EXTS), so a kill mid-download leaves nothing
+    that could be miscounted, and it's removed in `finally` either way.
     """
     if not url or end_time <= start_time:
         return DL_PERMANENT, "invalid url or time range"
@@ -496,48 +501,61 @@ def download_clip(ytdlp_cmd, url, start_time, end_time, output_path):
             return DL_OK, "already on disk"
         os.remove(output_path)
 
-    staging_path = output_path + ".partial"
-    # Debris from a previous crashed/killed attempt at this exact clip is now stale.
-    if os.path.exists(staging_path):
-        try:
-            os.remove(staging_path)
-        except OSError:
-            pass
-    cleanup_partial_files(staging_path)
+    label_dir = os.path.dirname(output_path)
+    os.makedirs(label_dir, exist_ok=True)
 
-    cmd = ytdlp_cmd + [
-        "--quiet",
-        "--no-warnings",
-        "--no-playlist",
-        "--format", "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "--merge-output-format", "mp4",
-        "--external-downloader", "ffmpeg",
-        "--external-downloader-args", f"ffmpeg_i:-ss {start_time} -to {end_time}",
-        "-o", staging_path.replace('%', '%%'),  # '%' would otherwise be read as a yt-dlp template field
-        "--",
-        url
-    ]
+    # A leftover staging directory from a previous crashed/killed attempt (any clip in this
+    # folder) is necessarily stale -- a live run never leaves one behind past a single
+    # synchronous call to this function -- so clear any before starting a fresh one.
+    for stale in glob.glob(os.path.join(glob.escape(label_dir), '.dl_staging_*')):
+        shutil.rmtree(stale, ignore_errors=True)
 
+    staging_dir = tempfile.mkdtemp(dir=label_dir, prefix='.dl_staging_')
     try:
-        result = subprocess.run(
-            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            timeout=DOWNLOAD_TIMEOUT_SEC, encoding='utf-8', errors='replace'
-        )
-    except subprocess.TimeoutExpired:
-        cleanup_partial_files(staging_path)
-        return DL_TRANSIENT, f"timed out after {DOWNLOAD_TIMEOUT_SEC}s"
-    except OSError as exc:
-        cleanup_partial_files(staging_path)
-        return DL_TRANSIENT, f"could not launch yt-dlp: {exc}"
+        cmd = ytdlp_cmd + [
+            "--quiet",
+            "--no-warnings",
+            "--no-playlist",
+            "--format", "best[ext=mp4][height<=720]/bestvideo[ext=mp4][height<=720]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+            "--merge-output-format", "mp4",
+            "--external-downloader", "ffmpeg",
+            "--external-downloader-args", f"ffmpeg_i:-ss {start_time} -to {end_time}",
+            # %(ext)s as the LAST path component, nothing after it -- yt-dlp's documented safe
+            # form, so its post-merge extension-correction logic has nothing ambiguous to collide
+            # with (see docstring above).
+            "-o", os.path.join(staging_dir, "clip.%(ext)s"),
+            "--",
+            url
+        ]
 
-    if result.returncode == 0 and os.path.isfile(staging_path) and os.path.getsize(staging_path) > 0:
-        os.replace(staging_path, output_path)  # atomic: the real filename appears only once complete
-        return DL_OK, ""
+        try:
+            result = subprocess.run(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                timeout=DOWNLOAD_TIMEOUT_SEC, encoding='utf-8', errors='replace'
+            )
+        except subprocess.TimeoutExpired:
+            return DL_TRANSIENT, f"timed out after {DOWNLOAD_TIMEOUT_SEC}s"
+        except OSError as exc:
+            return DL_TRANSIENT, f"could not launch yt-dlp: {exc}"
 
-    cleanup_partial_files(staging_path)
-    detail_lines = (result.stderr or "").strip().splitlines()
-    detail = detail_lines[-1] if detail_lines else f"exit code {result.returncode}"
-    return classify_failure(result.stderr), detail
+        junk_suffixes = ('.part', '.ytdl', '.aria2', '.temp')
+        produced = [
+            p for p in glob.glob(os.path.join(glob.escape(staging_dir), 'clip.*'))
+            if not p.endswith(junk_suffixes)
+        ]
+
+        if result.returncode == 0 and len(produced) == 1 and os.path.getsize(produced[0]) > 0:
+            os.replace(produced[0], output_path)  # real filename appears only once complete
+            return DL_OK, ""
+
+        detail_lines = (result.stderr or "").strip().splitlines()
+        if result.returncode == 0 and not detail_lines:
+            detail = "yt-dlp reported success (exit code 0) but produced no single matching output file"
+        else:
+            detail = detail_lines[-1] if detail_lines else f"exit code {result.returncode}"
+        return classify_failure(result.stderr), detail
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
 
 # ==============================================================================
